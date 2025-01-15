@@ -411,36 +411,11 @@ class QuantAnalyzer:
         :param sim: QuantSim object
         :return: list of input quantizers, list of output quantizers and dictionary of param quantizers
         """
-        input_quantizers = []
-        output_quantizers = []
-        param_quantizers = {}
-
-        # Capture input quantizers if the op is a starting op
-        if op in sim.connected_graph.starting_ops:
-            cg_products = [cg_product for cg_product in op.inputs if cg_product.is_model_input]
-            for cg_product in cg_products:
-                assert len(cg_product.tensor_dict) == 1
-                input_name = list(cg_product.tensor_dict.values())[0]
-                if input_name in sim.qc_quantize_op_dict and sim.qc_quantize_op_dict[input_name].enabled:
-                    input_quantizers.append(sim.qc_quantize_op_dict[input_name])
-
-        # Capture output quantizers of the op
-        if op.output_ops and op.output_ops[0].type == 'branch':
-            # op having multiple outputs
-            cg_product = op.output_ops[0].output
-        else:
-            # op having single output
-            cg_product = op.output
-        for output_name in set(cg_product.tensor_dict.values()):
-            if output_name in sim.qc_quantize_op_dict and sim.qc_quantize_op_dict[output_name].enabled:
-                output_quantizers.append(sim.qc_quantize_op_dict[output_name])
-
-        # Capture param quantizers of the op
-        for param_name in op.parameters:
-            if param_name in sim.qc_quantize_op_dict and sim.qc_quantize_op_dict[param_name].enabled:
-                param_quantizers[param_name] = sim.qc_quantize_op_dict[param_name]
-
-        return (input_quantizers, output_quantizers, param_quantizers)
+        input_quantizers, output_quantizers, param_quantizers = sim.get_op_quantizers(op)
+        input_quantizers = [q for q in input_quantizers if q.enabled]
+        output_quantizers = [q for q in output_quantizers if q.enabled]
+        param_quantizers = {name: q for name, q in param_quantizers.items() if q.enabled}
+        return input_quantizers, output_quantizers, param_quantizers
 
     # pylint: disable=no-self-use, too-many-branches, too-many-locals
     def export_per_layer_encoding_min_max_range(self, sim: QuantizationSimModel, results_dir: str) -> Tuple[Dict, Dict]:
@@ -474,23 +449,26 @@ class QuantAnalyzer:
             # Get input activations' encodings if starting op
             for index, quantizer in enumerate(input_quantizers):
                 name = f"{op_name}_input_{index}"
-                min_max_range_for_activations_dict[name] = (quantizer.encodings[0].min, quantizer.encodings[0].max)
+                encodings = quantizer.get_encodings()
+                min_max_range_for_activations_dict[name] = (encodings[0].min, encodings[0].max)
 
             # Get output activations' encodings
             for index, quantizer in enumerate(output_quantizers):
                 name = f"{op_name}_output_{index}"
-                min_max_range_for_activations_dict[name] = (quantizer.encodings[0].min, quantizer.encodings[0].max)
+                encodings = quantizer.get_encodings()
+                min_max_range_for_activations_dict[name] = (encodings[0].min, encodings[0].max)
 
             # Get parameters' encodings
             for param_name, quantizer in param_quantizers.items():
                 name = re.sub(r'\W+', '_', f"{op_name}_{param_name}")
-                if len(quantizer.encodings) > 1: # per-channel
+                encodings = quantizer.get_encodings()
+                if len(encodings) > 1: # per-channel
                     per_channel_encodings = {}
-                    for index, encoding in enumerate(quantizer.encodings):
+                    for index, encoding in enumerate(encodings):
                         per_channel_encodings[f"{name}_{index}"] = (encoding.min, encoding.max)
                     min_max_range_for_weights_dict[name] = per_channel_encodings
                 else: # per-tensor
-                    min_max_range_for_weights_dict[name] = (quantizer.encodings[0].min, quantizer.encodings[0].max)
+                    min_max_range_for_weights_dict[name] = (encodings[0].min, encodings[0].max)
 
         create_and_export_min_max_ranges_plot(min_max_range_for_weights_dict, min_max_ranges_dir, title="weights")
         create_and_export_min_max_ranges_plot(min_max_range_for_activations_dict, min_max_ranges_dir, title="activations")
@@ -564,7 +542,7 @@ class QuantAnalyzer:
         os.makedirs(results_dir, exist_ok=True)
 
         histograms = quantizer.get_stats_histogram()
-        encodings = quantizer.encodings
+        encodings = quantizer.get_encodings()
 
         if not isinstance(encodings, List):
             encodings = [encodings]
@@ -651,11 +629,11 @@ class QuantAnalyzer:
                                                                           collect_input=False,
                                                                           collect_output=True)
             loss += mean_squared_error(fp32_out_acts[0].reshape(fp32_out_acts[0].shape[0], -1),
-                                       quantized_out_acts[0].reshape(fp32_out_acts[0].shape[0], -1)).sum()
+                                       quantized_out_acts[0].reshape(fp32_out_acts[0].shape[0], -1))
             total += fp32_out_acts[0].shape[0]
             batch_index += 1
             if batch_index == self._num_batches:
                 break
 
         average_loss = loss/total
-        return average_loss
+        return float(average_loss)

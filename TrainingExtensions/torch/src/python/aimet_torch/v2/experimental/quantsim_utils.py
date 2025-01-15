@@ -45,7 +45,6 @@ from aimet_torch.meta.connectedgraph import Op
 from aimet_torch.v2.nn import BaseQuantizationMixin, custom
 from aimet_torch.v2.quantization.affine.quantizer import AffineQuantizerBase
 from aimet_torch.v2.quantsim import QuantizationSimModel
-from aimet_torch import utils
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -105,21 +104,6 @@ def _propagate_output_encodings(sim: QuantizationSimModel,
     """ Propagate output encodings of all the modules that satisfies the given condition. """
     # pylint: disable=redefined-builtin
     cg = sim.connected_graph
-    qmodel = sim.model
-
-    def get_qmodule(op: Op):
-        orig_module = op.get_module()
-        if not orig_module:
-            return None
-
-        full_name = cg._module_to_name[orig_module] # pylint: disable=protected-access
-        _, *module_names = full_name.split('.')
-
-        if not module_names:
-            return None
-
-        module_name = '.'.join(module_names)
-        return utils.get_named_module(qmodel, module_name)
 
     def _set_src_qtzr(x: Product, consumer: Op, qtzr):
         producer = x.producer
@@ -132,7 +116,7 @@ def _propagate_output_encodings(sim: QuantizationSimModel,
             # ``x`` is a root input (i.e. has no producer).
             # In this case, set the input quantizer of the consumer to ``qtzr``
             i = consumer.inputs.index(x)
-            qmodule = get_qmodule(consumer)
+            qmodule = sim._get_qmodule(consumer) # pylint: disable=protected-access
 
             if not qmodule:
                 return
@@ -146,7 +130,7 @@ def _propagate_output_encodings(sim: QuantizationSimModel,
             qmodule.input_quantizers[i] = qtzr
             return
 
-        qmodule = get_qmodule(producer)
+        qmodule = sim._get_qmodule(producer) # pylint: disable=protected-access
 
         if qmodule:
             # There exists a qmodule associated with the graph node ``producer``
@@ -171,7 +155,7 @@ def _propagate_output_encodings(sim: QuantizationSimModel,
 
 
     for op in reversed(cg.ordered_ops):
-        qmodule = get_qmodule(op)
+        qmodule = sim._get_qmodule(op) # pylint: disable=protected-access
 
         if not qmodule:
             continue
@@ -234,7 +218,11 @@ def set_matmul_second_input_producer_to_8bit_symmetric(sim: 'QuantizationSimMode
         return connected_graph._module_to_op_dict[original_module]
 
     def get_closest_producer(op: Op):
-        quant_module = quant_modules.get(op.dotted_name.removeprefix(f'{model_name}.'), None)
+        prefix = f'{model_name}.'
+        dotted_name = op.dotted_name
+        if dotted_name.startswith(prefix):
+            dotted_name = dotted_name[len(prefix):]
+        quant_module = quant_modules.get(dotted_name, None)
         if quant_module:
             if quant_module.output_quantizers[0]:
                 return quant_module

@@ -77,7 +77,9 @@ mkdir build && cd build
 # To include torch, use -DENABLE_TORCH=ON. To exclude torch, use -DENABLE_TORCH=OFF.
 # To include tensorflow, use -DENABLE_TENSORFLOW=ON. To exclude tensorflow, use -DENABLE_TENSORFLOW=OFF.
 # To include onnx, use -DENABLE_ONNX=ON. To exclude onnx, use -DENABLE_ONNX=OFF.
-cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DENABLE_CUDA=ON -DENABLE_TORCH=ON -DENABLE_TENSORFLOW=ON -DENABLE_ONNX=ON
+# Add a installation location -DCMAKE_INSTALL_PREFIX="<install_path>"
+# Following is an example command for the Torch GPU variant with installation within the current build path. Please modify it as appropriate.
+cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DENABLE_CUDA=ON -DENABLE_TORCH=ON -DENABLE_TENSORFLOW=OFF -DENABLE_ONNX=OFF -DCMAKE_INSTALL_PREFIX="./staging/universal"
 
 make -j8
 ```
@@ -120,8 +122,6 @@ Code may *optionally* be developed inside a development docker container. This s
 Set the `<variant_string>` to ONE of the following depending on your desired variant
 - For the PyTorch 2.1 GPU variant, use `"torch-gpu"`
 - For the PyTorch 2.1 CPU variant, use `"torch-cpu"`
-- For the PyTorch 1.13 GPU variant, use `"torch-gpu-pt113"`
-- For the PyTorch 1.13 CPU variant, use `"torch-cpu-pt113"`
 - For the TensorFlow GPU variant, use `"tf-gpu"`
 - For the TensorFlow CPU variant, use `"tf-cpu"`
 - For the ONNX GPU variant, use `"onnx-gpu"`

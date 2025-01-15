@@ -93,6 +93,9 @@ DTYPE GetMax(const DTYPE* data, int cnt, ComputationMode cpuGpuMode);
 template <typename DTYPE>
 DTYPE GetMin(const DTYPE* data, int cnt, ComputationMode cpuGpuMode);
 
+template <typename DTYPE>
+std::tuple<DTYPE, DTYPE> GetMinMax(const DTYPE* data, int cnt, ComputationMode cpuGpuMode);
+
 // Android compiler doesn't have std::log2, so define it here
 double logBase2(double d);
 
@@ -209,6 +212,7 @@ void updateTensorHistogram_cpu(const DTYPE* data, int tensorSize, TensorProfilin
 std::vector<double> rescaleHistogram(const std::vector<double>& srcHist, const double srcHistMin,
                                      const double srcHistMax, const double destHistMin, const double destHistMax);
 
+
 // GPU implementations...
 #ifdef GPU_QUANTIZATION_ENABLED
 
@@ -217,6 +221,9 @@ DTYPE GetMax_gpu(const DTYPE* data, int cnt);
 
 template <typename DTYPE>
 DTYPE GetMin_gpu(const DTYPE* data, int cnt);
+
+template <typename DTYPE>
+std::tuple<DTYPE, DTYPE> GetMinMax_gpu(const DTYPE* data, int cnt);
 
 void ElementwiseMult_gpu(const float* in, size_t cnt, float factor, float* out);
 

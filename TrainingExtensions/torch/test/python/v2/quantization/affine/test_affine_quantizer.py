@@ -883,20 +883,15 @@ def test_is_initialized_with_deepspeed_zero3(init_process_group, deepspeed_zero3
     qdq = QuantizeDequantize((10,), bitwidth=8, symmetric=True, encoding_analyzer=MinMaxEncodingAnalyzer((10,)))
     engine, *_ = ds.initialize(model=qdq, config=deepspeed_zero3_config)
     qdq_zero3 = engine.module
-    with ds.zero.GatheredParameters(qdq_zero3.parameters(), modifier_rank=0):
-        qdq_zero3.set_range(-1, 1)
-        assert qdq_zero3.is_initialized()
+    qdq_zero3.set_range(-1, 1)
     assert qdq_zero3.is_initialized()
 
-    # TODO (kyunggeu): Support the below use case
-    # qdq = QuantizeDequantize((10,), bitwidth=8, symmetric=True, encoding_analyzer=MinMaxEncodingAnalyzer((10,)))
-    # engine, *_ = ds.initialize(model=qdq, config=deepspeed_zero3_config)
-    # qdq_zero3 = engine.module
-    # with ds.zero.GatheredParameters(qdq_zero3.parameters(), modifier_rank=0):
-    #     with qdq_zero3.compute_encodings():
-    #         _ = qdq_zero3(torch.arange(-5, 5, dtype=torch.float, device='cuda:0'))
-    #     assert qdq_zero3.is_initialized()
-    # assert qdq_zero3.is_initialized()
+    qdq = QuantizeDequantize((10,), bitwidth=8, symmetric=True, encoding_analyzer=MinMaxEncodingAnalyzer((10,)))
+    engine, *_ = ds.initialize(model=qdq, config=deepspeed_zero3_config)
+    qdq_zero3 = engine.module
+    with qdq_zero3.compute_encodings():
+        _ = qdq_zero3(torch.arange(-5, 5, dtype=torch.float, device='cuda:0'))
+    assert qdq_zero3.is_initialized()
 
     """
     When: Gather the partitioned quantization parameters in writable mode but don't modify them
@@ -1009,7 +1004,7 @@ def test_quantized_tensor_with_block_size():
                   block_size=(2, 4, 3))
     with bq.compute_encodings():
         _ = bq(tensor)
-    assert bq.get_encoding().block_size == bq.block_size
+    assert bq.get_encodings().block_size == bq.block_size
     q = bq(tensor)
     assert q.encoding.block_size == bq.block_size
     assert torch.equal(q.dequantize(), affine.dequantize(q, bq.get_scale(), bq.get_offset(), bq.block_size))
@@ -1548,3 +1543,47 @@ def test_parse_args_error():
     Then: Create quantizer normally
     """
     Quantize((1, 10), -128, 127, True)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize('symmetric', [True, False])
+def test_signed_doesnt_affect_output(symmetric):
+    """
+    When: Quantize/Dequantize the same tensor with signed and unsigned quantizers
+    Then:
+      1) The quantized outputs should be equal with proper shifting
+      2) The quantize-dequantized outputs should be equal
+    """
+    q_int8 = Quantize(shape=(), bitwidth=8, symmetric=symmetric)
+    q_int8.signed = True
+    q_uint8 = Quantize(shape=(), bitwidth=8, symmetric=symmetric)
+    q_uint8.signed = False
+
+    x = torch.arange(-10.0, 6.0)
+
+    with q_int8.compute_encodings(), \
+            q_uint8.compute_encodings():
+        _ = q_int8(x)
+        _ = q_uint8(x)
+
+    out_int8 = q_int8(x)
+    out_uint8 = q_uint8(x)
+    assert torch.equal(out_int8, out_uint8 - 128)
+    assert torch.equal(out_int8.dequantize(), out_uint8.dequantize())
+
+    qdq_int8 = QuantizeDequantize(shape=(), bitwidth=8, symmetric=symmetric)
+    qdq_int8.signed = True
+    qdq_uint8 = QuantizeDequantize(shape=(), bitwidth=8, symmetric=symmetric)
+    qdq_uint8.signed = False
+
+    x = torch.arange(-10.0, 6.0)
+
+    with qdq_int8.compute_encodings(), \
+            qdq_uint8.compute_encodings():
+        _ = qdq_int8(x)
+        _ = qdq_uint8(x)
+
+    out_int8 = qdq_int8(x)
+    out_uint8 = qdq_uint8(x)
+    assert torch.equal(out_int8, out_uint8)
+    assert torch.equal(out_int8.quantize(), out_uint8.quantize() - 128)

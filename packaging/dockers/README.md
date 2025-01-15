@@ -25,8 +25,6 @@ Set the *<variant_string>* to ONE of the following depending on your desired var
 
 * For the PyTorch 2.1.2 GPU variant, use **torch_gpu**
 * For the PyTorch 2.1.2 CPU variant, use **torch_cpu**
-* For the PyTorch 1.13 GPU variant, use **torch_gpu_pt113**
-* For the PyTorch 1.13 CPU variant, use **torch_cpu_pt113**
 * For the TensorFlow GPU variant, use **tf_gpu**
 * For the TensorFlow CPU variant, use **tf_cpu**
 * For the ONNX GPU variant, use **onnx_gpu**

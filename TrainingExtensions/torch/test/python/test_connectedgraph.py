@@ -46,13 +46,13 @@ import torch.nn.functional as F
 import aimet_torch.utils
 from aimet_common.connected_graph.connectedgraph_utils import get_all_input_ops, get_all_output_ops,\
     get_all_ops_with_constant_inputs, CG_SPLIT
-from models import test_models
+from .models import test_models
 from aimet_common.connected_graph.product import Product
 from aimet_torch.meta.connectedgraph import ConnectedGraph
 from aimet_torch.meta.operation import Op
 from aimet_torch.meta import connectedgraph_utils
 from aimet_torch.utils import create_rand_tensors_given_shapes, get_device
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 
 
 class TestConnectedGraph(unittest.TestCase):
@@ -553,6 +553,155 @@ class TestConnectedGraph(unittest.TestCase):
         # ordered_ops filter out SplitOp inserted by ConnectedGraph
         self.assertEqual(4, len(connected_graph.ordered_ops))
 
+    def test_graph_input_structure(self):
+        model = test_models.SingleResidual()
+        model.eval()
+        inp_shape = (1, 3, 32, 32)
+        inp_tensor_list = create_rand_tensors_given_shapes(inp_shape, get_device(model))
+        conn_graph = ConnectedGraph(model, inp_tensor_list)
+
+        self.assertEqual(model.conv1, conn_graph.input_structure[0].op.get_module())
+
+    def test_graph_output_structure(self):
+        model = test_models.SingleResidual()
+        model.eval()
+        inp_shape = (1, 3, 32, 32)
+        inp_tensor_list = create_rand_tensors_given_shapes(inp_shape, get_device(model))
+        conn_graph = ConnectedGraph(model, inp_tensor_list)
+
+        self.assertEqual(model.fc, conn_graph.output_structure.op.get_module())
+
+    def test_graph_input_structure_with_nested_inputs_and_outputs(self):
+        class ModelWithMultiInputMultiOutput(nn.Module):
+            def __init__(self):
+                super(ModelWithMultiInputMultiOutput, self).__init__()
+                self.conv1_a_i = nn.Conv2d(1, 10, kernel_size=5)
+                self.maxpool1_a = nn.MaxPool2d(2)
+                self.relu1_a = nn.ReLU()
+
+                self.conv1_a_ii = nn.Conv2d(1, 10, kernel_size=5)
+
+                self.conv1_b = nn.Conv2d(1, 10, kernel_size=5)
+                self.maxpool1_b = nn.MaxPool2d(2)
+                self.relu1_b = nn.ReLU()
+
+                self.conv1_c = nn.Conv2d(1, 10, kernel_size=5)
+                self.maxpool1_c = nn.MaxPool2d(2)
+                self.relu1_c = nn.ReLU()
+
+                self.conv2_a = nn.Conv2d(10, 20, kernel_size=5)
+                self.maxpool2_a = nn.MaxPool2d(2)
+                self.relu2_a = nn.LeakyReLU()
+
+                self.conv2_b = nn.Conv2d(10, 20, kernel_size=5)
+                self.maxpool2_b = nn.MaxPool2d(2)
+                self.relu2_b = nn.LeakyReLU()
+
+                self.softmax_1 = nn.LogSoftmax(dim=1)
+                self.softmax_2 = nn.LogSoftmax(dim=1)
+
+            def forward(self, x1, x23):
+                x2, x3 = x23
+
+                x1 = self.relu1_a(self.maxpool1_a(self.conv1_a_i(x1) + self.conv1_a_ii(x1)))
+                x2 = self.relu1_b(self.maxpool1_b(self.conv1_b(x2)))
+                x3 = self.relu1_c(self.maxpool1_c(self.conv1_c(x3)))
+                y1 = x1 + x2
+                y2 = x2 + x3
+
+                y1 = y1.transpose(2, 3)
+                y1 = self.relu2_a(self.maxpool2_a(self.conv2_a(y1)))
+                y1 = self.softmax_1(y1)
+
+                y2 = self.relu2_b(self.maxpool2_b(self.conv2_b(y2)))
+                y2 = self.softmax_2(y2)
+
+                return y1, y2, (x1, x2, x3)
+
+        model = ModelWithMultiInputMultiOutput()
+
+        input_shape = (1, 1, 28, 28)
+        input_tensor = create_rand_tensors_given_shapes([input_shape, [input_shape, input_shape]], get_device(model))
+        conn_graph = ConnectedGraph(model, input_tensor)
+
+        self.assertEqual(model.conv1_a_i, conn_graph.input_structure[0][0].op.get_module())
+        self.assertEqual(model.conv1_a_ii, conn_graph.input_structure[0][1].op.get_module())
+        self.assertEqual(model.conv1_b, conn_graph.input_structure[1][0][0].op.get_module())
+        self.assertEqual(model.conv1_c, conn_graph.input_structure[1][1][0].op.get_module())
+        self.assertEqual(model.relu1_a, conn_graph.output_structure[2][0].op.get_module())
+        self.assertEqual(model.relu1_b, conn_graph.output_structure[2][1].op.get_module())
+        self.assertEqual(model.relu1_c, conn_graph.output_structure[2][2].op.get_module())
+        self.assertEqual(model.softmax_1, conn_graph.output_structure[0].op.get_module())
+        self.assertEqual(model.softmax_2, conn_graph.output_structure[1].op.get_module())
+        return
+
+    def test_graph_input_output_with_passthrough(self):
+        class ModelWithPassthroughOutput(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = nn.Conv2d(3, 3, 3)
+
+            def forward(self, x, y):
+                x = self.conv(x)
+                return x, y
+
+        model = ModelWithPassthroughOutput()
+        input_shape = (1, 3, 3, 3)
+        input_tensor_list = create_rand_tensors_given_shapes([input_shape, input_shape], get_device(model))
+        conn_graph = ConnectedGraph(model, input_tensor_list)
+
+        self.assertEqual(model.conv, conn_graph.input_structure[0][0].op.get_module())
+        self.assertEqual([None], conn_graph.input_structure[1])
+        self.assertEqual(model.conv, conn_graph.output_structure[0].op.get_module())
+        self.assertEqual(None, conn_graph.output_structure[1])
+
+    def test_graph_input_output_with_conditional(self):
+        class LinearConditionalModel(torch.nn.Module):
+            def __init__(self):
+                super(LinearConditionalModel, self).__init__()
+                self.l1 = torch.nn.Linear(in_features=128, out_features=128)
+                self.l2 = torch.nn.Linear(in_features=128, out_features=128)
+                self.l3 = torch.nn.Linear(in_features=128, out_features=128)
+
+            def forward(self, x, y):
+                if y:
+                    return self.l1(x)
+                else:
+                    return self.l2(x) + self.l3(x)
+
+        model = LinearConditionalModel()
+        model.eval()
+
+        dummy_input = (torch.randn(128, 128), torch.tensor(data=True, dtype=torch.bool))
+        conn_graph = ConnectedGraph(model, dummy_input)
+
+        self.assertEqual(model.l1, conn_graph.input_structure[0][0].op.get_module())
+        self.assertEqual(model.l1, conn_graph.output_structure.op.get_module())
+
+    def test_graph_input_output_indices(self):
+        class ModelWithMatMul(nn.Module):
+            def __init__(self):
+                super(ModelWithMatMul, self).__init__()
+                self.matmul = aimet_modules.MatMul()
+
+            def forward(self, x, y):
+                z = self.matmul(y, x)
+                return z
+
+        model = ModelWithMatMul()
+        model.eval()
+
+        dummy_input = (torch.randn(128, 128), torch.randn(128, 128))
+        conn_graph = ConnectedGraph(model, dummy_input)
+
+        self.assertEqual(model.matmul, conn_graph.input_structure[0][0].op.get_module())
+        self.assertEqual(model.matmul, conn_graph.input_structure[1][0].op.get_module())
+        self.assertEqual(model.matmul, conn_graph.output_structure.op.get_module())
+
+        self.assertEqual(1, conn_graph.input_structure[0][0].index)
+        self.assertEqual(0, conn_graph.input_structure[1][0].index)
+        self.assertEqual(0, conn_graph.output_structure.index)
+
 
 class ModelWithMultipleActivations(nn.Module):
     def __init__(self):
@@ -1015,3 +1164,21 @@ class TestConnectedGraphUtils(unittest.TestCase):
         assert len(add_1.inputs) == 2
         assert add_1.inputs == [p3, p4]
         assert p5.name not in mcg._products.keys()
+
+    def test_custom_ops_to_treat_as_leaf_module(self):
+        class RMSNormModel(torch.nn.Module):
+            def __init__(self):
+                super(RMSNormModel, self).__init__()
+                self.rms_norm_0 = aimet_modules.RmsNorm([5, 2, 3], [2], 1e-5)
+
+            def forward(self, inp):
+                x = self.rms_norm_0(inp)
+                return x
+
+        model = RMSNormModel()
+        dummy_input = torch.randn(5, 2, 3)
+
+        cg = ConnectedGraph(model, dummy_input)
+        assert len(cg.get_all_ops()) == 1
+        assert cg.ordered_ops[0].inputs[0].is_model_input
+        assert cg.ordered_ops[0].get_module() == model.rms_norm_0

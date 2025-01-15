@@ -45,6 +45,7 @@ target_link_libraries(PyModelOptimizations PUBLIC
         MoDlEqualization
         MoDlCompression
         ${OPENCV_LINK_LIBRARIES}
+        z
         )
 
 if (ENABLE_CUDA)
@@ -61,6 +62,8 @@ set_target_properties(PyModelOptimizations
          SUFFIX ".${Python3_SOABI}.so"
          LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/artifacts/aimet_common/"
       )
+
+add_dependencies(PyModelOptimizations generate_deps)
 
 install(TARGETS PyModelOptimizations
         LIBRARY

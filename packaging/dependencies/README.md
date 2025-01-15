@@ -60,19 +60,6 @@ Dependency Tree
 │   ├── reqs_pip_common.txt -> ../reqs_pip_common.txt
 │   ├── reqs_pip_torch_common.txt -> ../reqs_pip_torch_common.txt
 │   └── reqs_pip_torch_gpu.txt
-├── torch-cpu-pt113
-│   ├── reqs_deb_common.txt -> ../reqs_deb_common.txt
-│   ├── reqs_deb_torch_common.txt -> ../reqs_deb_torch_common.txt
-│   ├── reqs_pip_common.txt -> ../reqs_pip_common.txt
-│   ├── reqs_pip_torch_common.txt -> ../reqs_pip_torch_common.txt
-│   └── reqs_pip_torch_cpu.txt
-└── torch-gpu-pt113
-    ├── reqs_deb_common.txt -> ../reqs_deb_common.txt
-    ├── reqs_deb_torch_common.txt -> ../reqs_deb_torch_common.txt
-    ├── reqs_deb_torch_gpu.txt
-    ├── reqs_pip_common.txt -> ../reqs_pip_common.txt
-    ├── reqs_pip_torch_common.txt -> ../reqs_pip_torch_common.txt
-    └── reqs_pip_torch_gpu.txt
 
 9 directories, 62 files
 ```

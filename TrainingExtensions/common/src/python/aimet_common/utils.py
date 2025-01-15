@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2018-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2018-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -39,7 +39,9 @@
 
 import sys
 from contextlib import contextmanager
+import functools
 import json
+import importlib.util
 import logging
 import logging.config
 import logging.handlers
@@ -49,15 +51,15 @@ import signal
 import subprocess
 import threading
 import time
+import warnings
 from enum import Enum
 from typing import Callable, Dict, List, Optional, TextIO, Union, Any
 import multiprocessing
-import yaml
 from tqdm import tqdm
 from bokeh.server.server import Server
 from bokeh.application import Application
+from aimet_common import defs
 
-SAVE_TO_YAML = False
 
 try:
     # The build system updates Product, Version and Feature set information in the package_info file.
@@ -70,6 +72,24 @@ except ImportError:
     Postfix = ''
 
 
+def _red(msg: str):
+    return f'\x1b[31;21m{msg}\x1b[0m'
+
+
+def deprecated(msg: str):
+    """
+    Wrap a function or class such that a deprecation warning is printed out when invoked
+    """
+    def decorator(_callable):
+        @functools.wraps(_callable)
+        def fn_wrapper(*args, **kwargs):
+            warnings.warn(_red(f'{_callable.__qualname__} will be deprecated soon in the later versions. {msg}'),
+                          DeprecationWarning, stacklevel=2)
+            return _callable(*args, **kwargs)
+        return fn_wrapper
+    return decorator
+
+
 class ModelApi(Enum):
     """ Enum differentiating between Pytorch or Tensorflow """
     pytorch = 0
@@ -78,17 +98,7 @@ class ModelApi(Enum):
     onnx = 3
 
 
-class CallbackFunc:
-    """
-    Class encapsulating callback function, and it's argument(s)
-    """
-    def __init__(self, func: Callable, func_callback_args=None):
-        """
-        :param func: Callable Function
-        :param func_callback_args: Arguments passed to the callable function as-is.
-        """
-        self.func = func
-        self.args = func_callback_args
+CallbackFunc = defs.CallbackFunc
 
 
 class SingletonType(type):
@@ -324,20 +334,17 @@ def log_package_info():
         logging.info("%s", Product)
 
 
+@deprecated("This function will be deprecated in a future AIMET release. Saving to YAML has also been deprecated and"
+            " only a json file will be saved.")
 def save_json_yaml(file_path: str, dict_to_save: dict):
     """
-    Function which saves encoding in YAML and JSON file format
-    :param file_path: file name to use to generate the yaml and json file
+    Function which saves encoding in JSON file format
+    :param file_path: file name to use to generate the json file
     :param dict_to_save: dictionary to save
     """
     encoding_file_path_json = file_path
     with open(encoding_file_path_json, 'w') as encoding_fp_json:
         json.dump(dict_to_save, encoding_fp_json, sort_keys=True, indent=4)
-
-    if SAVE_TO_YAML:
-        encoding_file_path_yaml = file_path + '.yaml'
-        with open(encoding_file_path_yaml, 'w') as encoding_fp_yaml:
-            yaml.dump(dict_to_save, encoding_fp_yaml, default_flow_style=False, allow_unicode=True)
 
 
 class TqdmStreamHandler(logging.StreamHandler):
@@ -504,3 +511,25 @@ def profile(label: str, file: Union[str, os.PathLike, TextIO] = None, new_file: 
     finally:
         if should_close:
             file.close()
+
+
+def import_from_path(module_name, file_path):
+    """
+    Import a module from a given file path
+
+    :param module_name: The name to assign to the module
+    :param file_path: The path to the module file
+    :return: The imported module
+    """
+
+    file_path = os.path.abspath(file_path)
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+
+    # if the module is already present return it
+    if module_name in sys.modules and sys.modules[module_name].__spec__ == spec:
+        return sys.modules[module_name]
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module

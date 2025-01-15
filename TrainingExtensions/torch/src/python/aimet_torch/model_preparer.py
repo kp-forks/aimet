@@ -138,7 +138,7 @@ import torch.fx
 from aimet_common.utils import AimetLogger
 from aimet_torch.utils import in_eval_mode
 from aimet_torch.utils import replace_modules_of_type1_with_type2
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.ModelPreparer)
 
@@ -175,6 +175,7 @@ functional_with_stateful_api = {
     'sigmoid'       : torch.nn.Sigmoid,
     'hardsigmoid'   : torch.nn.Hardsigmoid,
     'silu'          : torch.nn.SiLU,
+    'scaled_dot_product_attention': aimet_modules.ScaledDotProductAttention,
 }
 
 

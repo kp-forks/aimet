@@ -50,11 +50,12 @@ import aimet_torch.v2.nn as aimet_nn
 from aimet_torch.v2.nn import QuantizationMixin
 from aimet_torch.v2.quantization.affine import Quantize, QuantizeDequantize
 from aimet_torch.v2.quantization.encoding_analyzer import MinMaxEncodingAnalyzer
-from aimet_torch.nn.modules.custom import Add
+from aimet_torch._base.nn.modules.custom import Add
 from aimet_torch import onnx_utils
 from aimet_torch.v2.quantsim import QuantizationSimModel
-from aimet_torch.quantsim import OnnxExportApiArgs
-from aimet_torch.qc_quantize_op import QcQuantizeWrapper
+from aimet_torch.v1.quantsim import OnnxExportApiArgs
+from aimet_torch.v1.qc_quantize_op import QcQuantizeWrapper
+from aimet_common.defs import QuantScheme
 from aimet_torch.utils import get_layer_by_name
 
 from ..models_.models_to_test import (
@@ -363,7 +364,7 @@ class TestQuantsimOnnxExport:
 
     @torch.no_grad()
     def test_json_interchangeable(self):
-        from aimet_torch.quantsim import QuantizationSimModel as QuantizationSimModelV1
+        from aimet_torch.v1.quantsim import QuantizationSimModel as QuantizationSimModelV1
         from aimet_torch.v2.quantsim import QuantizationSimModel
 
         torch.manual_seed(0)
@@ -371,8 +372,8 @@ class TestQuantsimOnnxExport:
         model = resnet18().eval()
         dummy_input = torch.randn(1, 3, 224, 224)
 
-        sim_v1 = QuantizationSimModelV1(model, dummy_input)
-        sim_v2 = QuantizationSimModel(model, dummy_input)
+        sim_v1 = QuantizationSimModelV1(model, dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced)
+        sim_v2 = QuantizationSimModel(model, dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced)
 
         sim_v1.compute_encodings(lambda model, _: model(dummy_input), None)
         sim_v2.compute_encodings(lambda model, _: model(dummy_input), None)

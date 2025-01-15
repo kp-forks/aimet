@@ -282,7 +282,7 @@ def docstring(doc: str):
 
 def _map_qmodule(modules, func):
     # pylint: disable=import-outside-toplevel
-    # pylint: disable=protected-access
+    # pylint: disable=protected-access, cyclic-import
     from aimet_torch.v2.nn import BaseQuantizationMixin
     contexts = []
     ctx = _ContextManager(action=lambda: None, cleanup=lambda:[context._cleanup() for context in contexts])
@@ -332,7 +332,7 @@ def remove_activation_quantizers(modules):
     context_2 = remove_output_quantizers(modules)
     # pylint: disable=protected-access
     return _ContextManager(action=lambda: None,
-                               cleanup=lambda: (context_1._cleanup(), context_2._cleanup()))
+                           cleanup=lambda: (context_1._cleanup(), context_2._cleanup()))
 
 def remove_all_quantizers(modules):
     '''
@@ -342,4 +342,44 @@ def remove_all_quantizers(modules):
     context_2 = remove_param_quantizers(modules)
     # pylint: disable=protected-access
     return _ContextManager(action=lambda: None,
-                               cleanup=lambda: (context_1._cleanup(), context_2._cleanup()))
+                           cleanup=lambda: (context_1._cleanup(), context_2._cleanup()))
+
+def has_no_quantizers(module, ignore_params: bool = False) -> bool:
+    """
+    Helper function to check if a module has any quantizers enabled
+    """
+    return (all(inp_qtzr is None for inp_qtzr in module.input_quantizers) and
+            all(out_qtzr is None for out_qtzr in module.output_quantizers) and
+            (ignore_params or all(param_qtzr is None for param_qtzr in module.param_quantizers.values())))
+
+def rgetattr(obj, attr):
+    """ Drop in replacement for __getattr__ that can handle dotted attribute strings """
+    return functools.reduce(getattr, [obj] + attr.split('.'))
+
+def rsetattr(obj, attr, val):
+    """ Drop in replacement for __setattr__ that can handle dotted attribute strings """
+    pre, _, post = attr.rpartition('.')
+    pre_obj = rgetattr(obj, pre) if pre else obj
+    return setattr(pre_obj, post, val)
+
+def apply_fn_recursively_to_all_elems(fn, container):
+    """ Apply fn to all elements in recursively composed container """
+    if container is None:
+        return None
+    if isinstance(container, (list, tuple)):
+        return [apply_fn_recursively_to_all_elems(fn, elem) for elem in container]
+    if isinstance(container, dict):
+        return {key: apply_fn_recursively_to_all_elems(fn, elem) for key, elem in container.items()}
+    return fn(container)
+
+def flatten_list(container):
+    """ Helper function to flatten nested list/tuple into 1D """
+    if not container:
+        return container
+    if not isinstance(container, (list, tuple)):
+        return [container]
+    if isinstance(container[0], (list, tuple)):
+        return flatten_list(container[0]) + flatten_list(container[1:])
+    if len(container) == 1:
+        return container
+    return container[:1] + flatten_list(container[1:])

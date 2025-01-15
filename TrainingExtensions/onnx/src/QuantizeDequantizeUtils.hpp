@@ -51,50 +51,6 @@
 
 
 template <typename T>
-void sliceTensorChannelGPU(const T* inTensor, T* outTensor, long iters, long copyWidth, long inputStride,
-                           long outputStride, long inputOffset, long outputOffset);
-
-
-template <typename T>
-void sliceTensorAlongAxis(const T* inTensor, std::vector<int64_t>& dims, size_t axis, size_t channel, T* outTensor,
-                          bool useCuda)
-{
-    uint64_t copyWidth = 1;
-    uint64_t iter      = 1;
-    for (int i = 0; i < dims.size(); i++)
-    {
-        if (i < axis)
-        {
-            iter *= dims[i];
-        }
-        else if (i > axis)
-        {
-            copyWidth *= dims[i];
-        }
-    }
-    uint64_t incr         = copyWidth * dims[axis];
-    uint64_t inputOffset  = copyWidth * channel;
-    uint64_t outputStride = copyWidth;
-    if (useCuda)
-    {
-#ifdef ONNX_CUDA
-        sliceTensorChannelGPU(inTensor, outTensor, iter, copyWidth, incr, outputStride, inputOffset, 0);
-#else
-        throw std::runtime_error("Not compiled for GPU mode.");
-#endif
-    }
-    else
-    {
-        for (long i = 0; i < iter; i++)
-        {
-            std::copy(inTensor + inputOffset, inTensor + inputOffset + copyWidth, outTensor + i * copyWidth);
-            inputOffset += incr;
-        }
-    }
-}
-
-
-template <typename T>
 void permuteTensorGPU(const T* inTensor, T* outTensor, int64_t numel, int64_t numDims, const int64_t* inputStrides,
                       const int64_t* outputStrides);
 
@@ -106,67 +62,10 @@ std::vector<int64_t> shapeToStrides(const std::vector<int64_t>& shape);
 
 int64_t getNumElements(const std::vector<int64_t>& shape);
 
-template <typename T>
-void quantizeDequantizePerChannel(
-    const T* inTensor, std::vector<int64_t>& shape, int axis, T* outTensor,
-    std::vector<DlQuantization::TfEncoding*>& encodings,
-    std::vector<DlQuantization::TensorQuantizer*>& tensorQuantizers, bool useCuda,
-    DlQuantization::IAllocator* allocator, void* stream,
-    std::unique_ptr<DlQuantization::ITensorQuantizationSim<float> >& tensorQuantizationSim)
-{
-    size_t channels   = shape[axis];
-    size_t numElement = 1;
-    size_t innerDims  = 1;
-    for (int i = 0; i < shape.size(); i++)
-    {
-        numElement *= shape[i];
-        if (i > axis)
-        {
-            innerDims *= shape[i];
-        }
-    }
-
-    T encVec[4][channels];
-    for (int i = 0; i < channels; i++)
-    {
-        encVec[0][i] = encodings[i]->min;
-        encVec[1][i] = encodings[i]->max;
-        encVec[2][i] = encodings[i]->delta;
-        encVec[3][i] = encodings[i]->offset;
-    }
-    T* encodingVectorDevice;
-    if (useCuda)
-    {
-#ifdef ONNX_CUDA
-        encodingVectorDevice = (T*) allocator->allocateRaw(4 * channels * sizeof(T));
-        cudaMemcpy(encodingVectorDevice, encVec, 4 * channels * sizeof(T), cudaMemcpyHostToDevice);
-#else
-        throw std::runtime_error("Not compiled for GPU mode.");
-#endif
-    }
-    else
-    {
-        encodingVectorDevice = (T*) encVec;
-    }
-
-    T* encodingMin    = encodingVectorDevice;
-    T* encodingMax    = encodingVectorDevice + channels;
-    T* encodingDelta  = encodingVectorDevice + 2 * channels;
-    T* encodingOffset = encodingVectorDevice + 3 * channels;
-
-    tensorQuantizationSim->quantizeDequantizeTensorPerChannel(inTensor, channels, numElement, innerDims, outTensor,
-                                                              encodingMin, encodingMax, encodingDelta, encodingOffset,
-                                                              tensorQuantizers[0]->roundingMode, useCuda, stream);
-    if (useCuda)
-    {
-        allocator->deleteRaw(encodingVectorDevice);
-    }
-}
-
 
 struct BroadcastShapeInfo
 {
-    BroadcastShapeInfo(const std::vector<int64_t>& inputShape, int channelAxis, int blockAxis, int blockSize);
+    BroadcastShapeInfo(const std::vector<int64_t>& inputShape, int channelAxis, int blockAxis, uint blockSize);
 
     bool hasContiguousBlocks() const;
 
@@ -198,13 +97,14 @@ void quantizeDequantizeBroadcast(const T* inTensor, T* outTensor, const Broadcas
     const int64_t* encodingStrides = shapeInfo.encodingStrides.data();
 
     // Kernels expect separate lists for each encoding type
-    T encVec[4][numEncodings];
+    std::vector<T> encVec(4 * numEncodings);
+
     for (int i = 0; i < numEncodings; i++)
     {
-        encVec[0][i] = encodings[i]->min;
-        encVec[1][i] = encodings[i]->max;
-        encVec[2][i] = encodings[i]->delta;
-        encVec[3][i] = encodings[i]->offset;
+        encVec[i] = encodings[i]->min;
+        encVec[numEncodings + i] = encodings[i]->max;
+        encVec[2 * numEncodings + i] = encodings[i]->delta;
+        encVec[3 * numEncodings + i] = encodings[i]->offset;
     }
     T* encodingVectorDevice;
     int64_t* stridesDevice = nullptr;
@@ -217,7 +117,7 @@ void quantizeDequantizeBroadcast(const T* inTensor, T* outTensor, const Broadcas
         encodingVectorDevice = static_cast<T*>(allocator->allocateRaw(4 * numEncodings * sizeof(T)));
 
         // Send encoding information to device
-        cudaMemcpyAsync(encodingVectorDevice, encVec, 4 * numEncodings * sizeof(T), cudaMemcpyHostToDevice,
+        cudaMemcpyAsync(encodingVectorDevice, encVec.data(), 4 * numEncodings * sizeof(T), cudaMemcpyHostToDevice,
                         static_cast<cudaStream_t>(stream));
 
         // Send stride information to device
@@ -237,7 +137,7 @@ void quantizeDequantizeBroadcast(const T* inTensor, T* outTensor, const Broadcas
     else
     {
         mode                 = DlQuantization::ComputationMode::COMP_MODE_CPU;
-        encodingVectorDevice = (T*) (encVec);
+        encodingVectorDevice = encVec.data();
     }
 
     T* encodingMin    = encodingVectorDevice;

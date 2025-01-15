@@ -39,7 +39,7 @@
 import torch
 from torch import nn
 
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 from aimet_torch.v2.nn import QuantizationMixin
 
 

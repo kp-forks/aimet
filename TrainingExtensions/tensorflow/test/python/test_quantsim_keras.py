@@ -1,7 +1,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -33,7 +33,7 @@
 #
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
-
+import contextlib
 import json
 import os
 import tempfile
@@ -48,8 +48,8 @@ from aimet_common.libpymo import TfEncoding
 from packaging import version
 from tensorflow import keras
 
-import aimet_common.utils
 from aimet_common.defs import QuantScheme, RANGE_LEARNING_SCHEMES
+from aimet_common import quantsim
 from aimet_tensorflow.examples.test_models import keras_model
 from aimet_tensorflow.keras.utils.quantizer_utils import SaveModelWithoutQuantsimWrappersCallback
 from aimet_tensorflow.keras.cross_layer_equalization import equalize_model
@@ -479,57 +479,47 @@ def test_model_with_tf_op_lambda_operators_multi_tf_static_inputs():
 
 def test_qat():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
+        model = dense_functional()
+        rand_inp = np.random.randn(10, 5)
+        rand_out = np.random.randn(10, 2)
+        qsim = QuantizationSimModel(model, quant_scheme='tf', default_param_bw=8, default_output_bw=8)
+        qsim.compute_encodings(lambda m, _: m.predict(rand_inp), None)
+        qsim.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+                           loss=tf.keras.losses.MeanSquaredError())
+        # Track weights for dense layer to check that they are updated during fit
+        running_weights = [tf.keras.backend.get_value(param) for
+                           param in qsim.model.layers[1]._layer_to_wrap.weights]
+        # Track encoding max for dense output quantizer to check that it is not updated during fit
+        running_dense_output_quantizer_encoding_max = \
+            tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
 
-        saved_flag = aimet_common.utils.SAVE_TO_YAML
-        aimet_common.utils.SAVE_TO_YAML = True
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            epochs = 10
+            save_model_callback = SaveModelWithoutQuantsimWrappersCallback(qsim, tmp_dir, "test_qat")
+            for i in range(epochs):
+                _ = qsim.model.fit(x=rand_inp, y=rand_out, batch_size=1, callbacks=save_model_callback)
+                ending_weights = [tf.keras.backend.get_value(param) for
+                                  param in qsim.model.layers[1]._layer_to_wrap.weights]
+                new_dense_output_quantizer_encoding_max = \
+                    tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
+                for idx, weight in enumerate(running_weights):
+                    assert not np.array_equal(weight, ending_weights[idx])
+                assert np.array_equal(new_dense_output_quantizer_encoding_max,
+                                      running_dense_output_quantizer_encoding_max)
+                running_weights = ending_weights
+                running_dense_output_quantizer_encoding_max = new_dense_output_quantizer_encoding_max
 
-        try:
-            model = dense_functional()
-            rand_inp = np.random.randn(10, 5)
-            rand_out = np.random.randn(10, 2)
-            qsim = QuantizationSimModel(model, quant_scheme='tf', default_param_bw=8, default_output_bw=8)
-            qsim.compute_encodings(lambda m, _: m.predict(rand_inp), None)
-            qsim.model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                               loss=tf.keras.losses.MeanSquaredError())
-            # Track weights for dense layer to check that they are updated during fit
-            running_weights = [tf.keras.backend.get_value(param) for
-                               param in qsim.model.layers[1]._layer_to_wrap.weights]
-            # Track encoding max for dense output quantizer to check that it is not updated during fit
-            running_dense_output_quantizer_encoding_max = \
-                tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
+            h5s = encodings = saved_models_folders = 0
+            for file in os.listdir(tmp_dir):
+                if file.endswith('h5'):
+                    h5s += 1
+                elif file.endswith('encodings'):
+                    encodings += 1
+                else:
+                    saved_models_folders += 1
 
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                epochs = 10
-                save_model_callback = SaveModelWithoutQuantsimWrappersCallback(qsim, tmp_dir, "test_qat")
-                for i in range(epochs):
-                    _ = qsim.model.fit(x=rand_inp, y=rand_out, batch_size=1, callbacks=save_model_callback)
-                    ending_weights = [tf.keras.backend.get_value(param) for
-                                      param in qsim.model.layers[1]._layer_to_wrap.weights]
-                    new_dense_output_quantizer_encoding_max = \
-                        tf.keras.backend.get_value(qsim.model.layers[1].output_quantizers[0]._encoding_max)
-                    for idx, weight in enumerate(running_weights):
-                        assert not np.array_equal(weight, ending_weights[idx])
-                    assert np.array_equal(new_dense_output_quantizer_encoding_max,
-                                          running_dense_output_quantizer_encoding_max)
-                    running_weights = ending_weights
-                    running_dense_output_quantizer_encoding_max = new_dense_output_quantizer_encoding_max
-
-                h5s = encodings = yamls = saved_models_folders = 0
-                for file in os.listdir(tmp_dir):
-                    if file.endswith('h5'):
-                        h5s += 1
-                    elif file.endswith('encodings'):
-                        encodings += 1
-                    elif file.endswith('yaml'):
-                        yamls += 1
-                    else:
-                        saved_models_folders += 1
-
-                for file_count in [h5s, encodings, yamls, saved_models_folders]:
-                    assert file_count == 1, f"QAT Save Callback did not work"
-
-        finally:
-            aimet_common.utils.SAVE_TO_YAML = saved_flag
+            for file_count in [h5s, encodings, saved_models_folders]:
+                assert file_count == 1, f"QAT Save Callback did not work"
 
 def test_range_learning():
     if version.parse(tf.version.VERSION) >= version.parse("2.00"):
@@ -1582,39 +1572,44 @@ def test_quantizable_lstm_export_encodings():
     timesteps = 10
     features = 16
     units = 32
+    kernel_1 = {'class_name': 'glorot_uniform', 'config': {'seed': 42}}
+    kernel_2 = {'class_name': 'glorot_uniform', 'config': {'seed': 43}}
+    recurrent_1 = {'class_name': 'orthogonal', 'config': {'seed': 44}}
+    recurrent_2 = {'class_name': 'orthogonal', 'config': {'seed': 45}}
 
     # STAGE 1 MODEL - Functional model created with layers.lstm
     stage_1_inputs = keras.Input(shape=(timesteps, features))
-    stage_1_output = keras.layers.LSTM(units, unroll=True)(stage_1_inputs)
+    stage_1_output = keras.layers.LSTM(units, unroll=True, kernel_initializer=kernel_1, recurrent_initializer=recurrent_1)(stage_1_inputs)
     stage_1_model = keras.Model(inputs=stage_1_inputs, outputs=stage_1_output)
     
     # STAGE 2 MODEL - Sequential model created with layers.lstm
     stage_2_model = keras.models.Sequential(
         [
-            keras.layers.LSTM(units, input_shape=(timesteps, features), unroll=True),
+            keras.layers.LSTM(units, input_shape=(timesteps, features), unroll=True, kernel_initializer=kernel_2, recurrent_initializer=recurrent_2),
         ]
     )
 
     rng = np.random.default_rng(seed=42)
     rn_input = rng.random([batch_size, timesteps, features])
 
-    # STAGE 3 MODEL - Quantized model created through QuantSim functional original
-    stage_3_model = QuantizationSimModel(stage_1_model)   
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # STAGE 3 MODEL - Quantized model created through QuantSim functional original
+        stage_3_model = QuantizationSimModel(stage_1_model)
 
-    stage_3_model.compute_encodings(lambda m, _: m(rn_input), None)
-    stage_3_model.export('./data', 'lstm_functional')
+        stage_3_model.compute_encodings(lambda m, _: m(rn_input), None)
+        stage_3_model.export(tmp_dir, 'lstm_functional')
 
-    # STAGE 4 MODEL - Quantized model created through QuantSim sequential original
-    stage_4_model = QuantizationSimModel(stage_2_model)
+        # STAGE 4 MODEL - Quantized model created through QuantSim sequential original
+        stage_4_model = QuantizationSimModel(stage_2_model)
+
+        stage_4_model.compute_encodings(lambda m, _: m(rn_input), None)
+        stage_4_model.export(tmp_dir, 'lstm_sequential')
    
-    stage_4_model.compute_encodings(lambda m, _: m(rn_input), None)
-    stage_4_model.export('./data', 'lstm_sequential')
-   
-    #Check QuantizationSimModel model created through originals
-    with open("./data/lstm_functional.encodings", "r") as encodings_file_functional, \
-        open("./data/lstm_sequential.encodings", "r") as encodings_file_sequential:
-        encodings_functional = json.load(encodings_file_functional)
-        encodings_sequential = json.load(encodings_file_sequential)
+        #Check QuantizationSimModel model created through originals
+        with open(Path(tmp_dir, "lstm_functional.encodings"), "r") as encodings_file_functional, \
+                open(Path(tmp_dir, "lstm_sequential.encodings"), "r") as encodings_file_sequential:
+            encodings_functional = json.load(encodings_file_functional)
+            encodings_sequential = json.load(encodings_file_sequential)
 
     for (model_layer, encodings) in (stage_3_model.model.layers[1], encodings_functional), (stage_4_model.model.layers[0], encodings_sequential):
         for wrapper in model_layer._wrapped_layers:
@@ -1632,3 +1627,28 @@ def test_quantizable_lstm_export_encodings():
                     assert param_name in encodings['param_encodings']
                     assert encodings['param_encodings'][param_name] == encoding_dict
 
+def test_quantsim_export_to_1_0_0():
+    @contextlib.contextmanager
+    def _swap_encoding_version():
+        old_version = quantsim.encoding_version
+        quantsim.encoding_version = '1.0.0'
+
+        yield
+
+        quantsim.encoding_version = old_version
+
+    model = dense_functional()
+    rand_inp = np.random.randn(100, 5)
+
+
+    qsim = QuantizationSimModel(model, quant_scheme='tf')
+    qsim.compute_encodings(lambda m, _: m(rand_inp), None)
+
+    with tempfile.TemporaryDirectory() as temp_dir, _swap_encoding_version():
+        assert quantsim.encoding_version == '1.0.0'
+        qsim.export(temp_dir, 'test_export')
+        assert quantsim.encoding_version == '1.0.0'
+
+        with open(os.path.join(temp_dir, 'test_export.encodings'), 'r') as encoding_file:
+            encodings = json.load(encoding_file)
+        assert encodings['version'] == '0.6.1'

@@ -1584,6 +1584,144 @@ class TestBatchNormFoldToScale:
         with pytest.raises(RuntimeError):
             fold_all_batch_norms_to_scale(sim)
 
+    @pytest.mark.parametrize("layer_type", ["GRU", "RNN"])
+    def test_bn_fold_with_gru_layer(self, layer_type):
+        def get_gru_model(layer_type):
+            _input = tf.keras.layers.Input(shape=(32, 32, 3), name="input")
+            x = tf.keras.layers.Conv2D(16, 3, strides=2, padding='same', activation=None)(_input)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.Activation(activation=tf.keras.activations.relu)(x)
+            x = tf.keras.layers.Conv2D(32, 3, strides=2, padding='same', activation=None)(x)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.Activation(activation=tf.keras.activations.relu)(x)
+            x = tf.keras.layers.Flatten()(x)
+            x = tf.keras.layers.Reshape(target_shape=(2, -1))(x)
+            if layer_type == "GRU":
+                x = tf.keras.layers.GRU(32, return_sequences=True, unroll=True)(x)
+            elif layer_type == "RNN":
+                x = tf.keras.layers.RNN(tf.keras.layers.GRUCell(32))(x)
+            else:
+                raise AttributeError(f"Found invalid layer_type: {layer_type}")
+            x = tf.keras.layers.Flatten()(x)
+            x = tf.keras.layers.Dense(128, activation=None)(x)
+            x = tf.keras.layers.Activation(activation=tf.keras.activations.relu)(x)
+            x = tf.keras.layers.Dense(10, activation='softmax')(x)
+            gru_model = tf.keras.Model(inputs=_input, outputs=x)
+            return gru_model
+
+        model = get_gru_model(layer_type)
+        mock_input = np.random.randn(1, 32, 32, 3)
+
+        node_to_layer_map = common.create_node_to_layer_map(model)
+        for node, connection in node_to_layer_map.items():
+            assert not isinstance(node.layer, tf.keras.layers.GRUCell)
+            if connection[0] is not None:
+                for inp_layer in connection[0]:
+                    assert not isinstance(inp_layer, tf.keras.layers.GRUCell)
+            assert not isinstance(connection[1], tf.keras.layers.GRUCell)
+
+        node_layer_types = {type(node_ref.layer) for node_ref in node_to_layer_map.keys()}
+        if layer_type == "GRU":
+            assert tf.keras.layers.GRU in node_layer_types
+        elif layer_type == "RNN":
+            assert tf.keras.layers.RNN in node_layer_types
+
+        output_before_batchnorm_folding = model(mock_input)
+        _, model = fold_all_batch_norms(model)
+        output_after_batchnorm_folding = model(mock_input)
+
+        assert np.allclose(output_before_batchnorm_folding, output_after_batchnorm_folding, atol=1e-4)
+
+    def test_bn_fold_with_kwargs_from_layer(self):
+        indices_input = tf.keras.layers.Input(shape=(None,), dtype=tf.int32, name='indices')
+        updates_input = tf.keras.layers.Input(shape=(None,), dtype=tf.float32, name='updates')
+        shape_1 = tf.keras.layers.Input(shape=(), dtype=tf.int32, name='shape_first_value')
+        conv_inp_layer = tf.keras.layers.Input(shape=(224, 224, 3), dtype=tf.float32)
+
+        conv_layer = tf.keras.layers.Conv2D(filters=1, kernel_size=(3, 3), strides=(1, 1), padding="valid")(conv_inp_layer)
+        bn_layer = tf.keras.layers.BatchNormalization()(conv_layer)
+        relu = tf.keras.layers.ReLU()(bn_layer)
+        scatter_nd_layer = tf.scatter_nd(indices_input, updates_input, shape=[shape_1[0], 4, 4])
+
+        scatter_model = tf.keras.models.Model(inputs=[conv_inp_layer, indices_input, updates_input, shape_1],
+                                              outputs=[relu, scatter_nd_layer])
+
+        conv_inp = np.random.randn(1, 224, 224, 3)
+        indices = tf.constant([[1], [3]], dtype=tf.int32)
+        updates = tf.constant([[[5, 5, 5, 5], [6, 6, 6, 6],
+                               [7, 7, 7, 7], [8, 8, 8, 8]],
+                              [[5, 5, 5, 5], [6, 6, 6, 6],
+                               [7, 7, 7, 7], [8, 8, 8, 8]]], dtype=tf.float32)
+        shape_first = tf.constant((4,), dtype=tf.int32)
+
+        fp32_outs = scatter_model([conv_inp, indices, updates, shape_first])
+
+        _, bn_folded_model = fold_all_batch_norms(scatter_model)
+
+        bn_outs = bn_folded_model([conv_inp, indices, updates, shape_first])
+
+        np.testing.assert_allclose(fp32_outs[0], bn_outs[0], atol=1e-4)
+        np.testing.assert_allclose(fp32_outs[1], bn_outs[1], atol=1e-4)
+
+    @pytest.mark.parametrize('set_dtype', [tf.float32, tf.float16, tf.int64, tf.int32])
+    def test_cast_op_with_same_dtypes(self, set_dtype):
+        input = tf.keras.layers.Input(shape=(7, 7, 3))
+        conv1 = tf.keras.layers.Conv2D(filters=1, kernel_size=3, strides=1, padding="valid")(input)
+        bn1 = tf.keras.layers.BatchNormalization()(conv1)
+        conv2 = tf.keras.layers.Conv2D(filters=1, kernel_size=3, strides=1, padding="valid")(input)
+        bn2 = tf.keras.layers.BatchNormalization()(conv2)
+        cast1 = tf.cast(bn1, dtype=set_dtype)
+        cast2 = tf.cast(bn2, dtype=set_dtype)
+        concat = tf.concat([cast1, cast2], axis=-1)
+        model = tf.keras.models.Model(inputs=[input], outputs=[concat])
+
+        dummy_inp = np.random.randn(1, 7, 7, 3)
+        outs = model(dummy_inp)
+
+        _, bn_folded_model = fold_all_batch_norms(model)
+        bn_outs = bn_folded_model(dummy_inp)
+
+        assert np.allclose(outs, bn_outs, atol=1e-04)
+
+        # Number of cast ops present in BatchNorm folded model
+        num_cast_ops = ["cast" in layer.name for layer in bn_folded_model.layers]
+        if set_dtype == tf.float32:
+            assert not any(num_cast_ops)
+        else:
+            # Only two cast ops should be present as the original model has two cast ops
+            assert sum(num_cast_ops) == 2
+
+    def test_split_op_model(self):
+        inp = tf.keras.layers.Input(shape=(3, 224, 224))
+        conv = tf.keras.layers.Conv2D(filters=1, kernel_size=3, strides=1, padding="valid")(inp)
+        bn = tf.keras.layers.BatchNormalization()(conv)
+        split, split2 = tf.split(bn, num_or_size_splits=2, axis=2)
+        split_3, split4 = tf.split(bn, num_or_size_splits=2, axis=2)
+        concat = tf.concat([split2, split_3], axis=1)
+        concat_2 = tf.concat([split, split4, split_3], axis=1)
+        model = tf.keras.models.Model(inputs=inp, outputs=[concat_2, concat])
+
+        dummy_inp = np.random.randn(1, 3, 224, 224)
+
+        fp32_outs = model(dummy_inp)
+
+        folded_pairs, bn_folded_model = fold_all_batch_norms(model)
+
+        bn_folded_outs = bn_folded_model(dummy_inp)
+
+        for idx, fp32_out in enumerate(fp32_outs):
+            assert np.allclose(fp32_out, bn_folded_outs[idx], atol=1e-04)
+
+        split_0_output_tensor_names = [x.name for x in bn_folded_model.layers[2].output]
+        split_1_output_tensor_names = [x.name for x in bn_folded_model.layers[3].output]
+
+        assert bn_folded_model.layers[4].input[0].name == split_0_output_tensor_names[0]
+        assert bn_folded_model.layers[4].input[1].name == split_1_output_tensor_names[1]
+        assert bn_folded_model.layers[4].input[2].name == split_1_output_tensor_names[0]
+
+        assert bn_folded_model.layers[5].input[0].name == split_0_output_tensor_names[1]
+        assert bn_folded_model.layers[5].input[1].name == split_1_output_tensor_names[0]
+
     @pytest.mark.skip("Possible Batch norms to fold is returning None?")
     def test_fold_auto_mode_with_bn_after_Conv1d_layer(self):
         input_shape = (2, 10, 32)

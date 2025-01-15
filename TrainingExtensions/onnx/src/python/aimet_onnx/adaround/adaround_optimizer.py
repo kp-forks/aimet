@@ -176,6 +176,8 @@ class AdaroundOptimizer:
             else:
                 model_inputs = cached_dataset[np.random.randint(len(cached_dataset))]
                 inp_data, orig_out_data = act_sampler.sample_acts(create_input_dict(orig_model.model, model_inputs))
+                inp_data, orig_out_data = torch.from_numpy(inp_data[0]).to(torch_device), torch.from_numpy(out_data[0]).to(torch_device)
+                # This assumes there's only 1 input and 1 output in the list output by sample_acts
 
 
             # Clear alpha's gradients before optimization step
@@ -263,6 +265,8 @@ class AdaroundOptimizer:
         :return: output of the module computed with AdaRounded weights
         """
         # Compute adarounded weights
+        # pylint: disable=too-many-branches
+
         device = 'cpu'
         if inp_data.is_cuda:
             device = inp_data.device
@@ -271,28 +275,32 @@ class AdaroundOptimizer:
 
         if quant_module.type == 'Conv':
             attributes = read_attributes_for_op(quant_module)
-            if attributes['pads']:
+            if 'pads' in attributes:
                 onnx_padding = attributes['pads']
                 torch_padding = [onnx_padding[1], onnx_padding[3], onnx_padding[0], onnx_padding[2]]
                 # Takes care of asymmetric padding within a spatial axis
                 inp_data = functional.pad(inp_data, pad=torch_padding)
+            else:
+                auto_pad = attributes.get("auto_pad", "NOTSET")
+                if auto_pad not in {"NOTSET", "VALID"}:
+                    raise NotImplementedError(f"Layer with auto_pad: {auto_pad} attribute is not supported.")
             bias = None
             if 'bias' in quant_module.params:
                 bias = torch.from_numpy(numpy_helper.to_array(quant_module.params['bias'].tensor)).to(device)
-            out_data = functional.conv2d(inp_data, adarounded_weights, bias=bias, stride=attributes['strides'],
-                                         dilation=attributes['dilations'], groups=attributes['group'])
+            out_data = functional.conv2d(inp_data, adarounded_weights, bias=bias, stride=attributes.get('strides', 1),
+                                         dilation=attributes.get('dilations', 1), groups=attributes.get('group', 1))
         elif quant_module.type == 'ConvTranspose':
             attributes = read_attributes_for_op(quant_module)
-            if attributes['pads']:
-                onnx_padding = attributes['pads']
-                torch_padding = [onnx_padding[1], onnx_padding[3], onnx_padding[0], onnx_padding[2]]
-                # Takes care of asymmetric padding within a spatial axis
-                inp_data = functional.pad(inp_data, pad=torch_padding)
+            if attributes.get("auto_pad", "NOTSET") not in ("NOTSET", "VALID"):
+                raise NotImplementedError("Layers with auto_pad attribute are currently not supported")
+            onnx_padding = attributes.get('pads', [0, 0, 0, 0])
+            torch_padding = [-onnx_padding[i] for i in (1, 3, 0, 2)]
             bias = None
             if 'bias' in quant_module.params:
                 bias = torch.from_numpy(numpy_helper.to_array(quant_module.params['bias'].tensor)).to(device)
-            out_data = functional.conv_transpose2d(inp_data, adarounded_weights, bias=bias, stride=attributes['strides'],
-                                                   dilation=attributes['dilations'], groups=attributes['group'])
+            out_data = functional.conv_transpose2d(inp_data, adarounded_weights, bias=bias, stride=attributes.get('strides', 1),
+                                                   dilation=attributes.get('dilations', 1), groups=attributes.get('group', 1))
+            out_data = functional.pad(out_data, pad=torch_padding)
         elif quant_module.type in ['Gemm']:
             if not quant_module.transposed_params:
                 # Pytorch requires tranposed weights in functional.linear

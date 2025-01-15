@@ -39,6 +39,7 @@ ARG REGISTRY
 FROM ${REGISTRY}ubuntu:jammy
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=DontWarn
 
 RUN apt-get update > /dev/null && \
     apt-get install --no-install-recommends -y \
@@ -100,6 +101,7 @@ RUN apt-get update > /dev/null && \
         less \
         libavcodec-dev \
         libavformat-dev \
+        libeigen3-dev \
         libgtest-dev \
         libgtk2.0-dev \
         libsox-dev \
@@ -134,7 +136,8 @@ RUN python3 -m pip --no-cache-dir install \
         cython \
         dataclasses \
         Deprecated \
-        docutils==0.16 \
+        docutils \
+        furo \
         graphviz \
         h5py \
         ipykernel \
@@ -150,7 +153,6 @@ RUN python3 -m pip --no-cache-dir install \
         opencv-python \
         Pillow==9.3.0 \
         pluggy==0.12.0 \
-        progressbar2 \
         protobuf==3.19.2 \
         psutil \
         ptflops \
@@ -165,9 +167,12 @@ RUN python3 -m pip --no-cache-dir install \
         scikit-learn==1.1.3 \
         scipy==1.8.1 \
         sphinx \
-        sphinx-jinja \
         sphinx-autodoc-typehints \
+        sphinx-copybutton \
+        sphinx-design \
+        sphinx-jinja \
         sphinx-rtd-theme \
+        sphinx-tabs \
         tensorboard==2.10.1 \
         tensorboardX==2.6 \
         tensorflow-cpu==2.10.1 \
@@ -177,7 +182,7 @@ RUN python3 -m pip --no-cache-dir install \
         torchvision==0.14.1 \
         timm==0.3.1 \
         tqdm \
-        transformers==4.38.1 \
+        transformers \
         wget && \
     python3 -m ipykernel.kernelspec
 
@@ -196,8 +201,6 @@ RUN wget -q https://github.com/opencv/opencv/archive/refs/tags/3.4.19.tar.gz -O 
 EXPOSE 25000
 RUN apt-get update && apt-get install -y openssh-server && rm -rf /var/lib/apt/lists/*
 RUN mkdir /var/run/sshd
-
-RUN apt-get update && apt-get install -y liblapacke liblapacke-dev && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y libjpeg8-dev && \
     rm -rf /var/lib/apt/lists/*

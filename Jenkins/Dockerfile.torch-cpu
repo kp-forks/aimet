@@ -142,33 +142,32 @@ RUN python3 -m pip --no-cache-dir install \
         datasets \
         Deprecated \
         deepspeed \
-        docutils==0.16 \
+        docutils \
+        furo \
         graphviz \
         grpcio \
         grpcio-tools \
         h5py \
         ipykernel \
         ipython \
-        Jinja2==3.0.3 \
+        Jinja2>=3.0.3 \
         jupyter \
         keras==2.2.4 \
         lmdb==1.2.1 \
         matplotlib>=3 \
         mock \
-        nbsphinx==0.8.12 \
+        nbsphinx \
         networkx \
         'numpy<1.24,>=1.20.5' \
-        onnx==1.16.1 \
+        onnx~=1.16.1 \
         onnxscript \
         onnxsim \
-        onnxruntime==1.18.1 \
+        onnxruntime~=1.18.1 \
         onnxruntime-extensions \
         opencv-python \
         peft \
         Pillow==9.3.0 \
         pluggy==0.12.0 \
-        progressbar2 \
-        protobuf==3.20.2 \
         psutil \
         ptflops \
         pybind11 \
@@ -180,22 +179,25 @@ RUN python3 -m pip --no-cache-dir install \
         pytest-cov \
         pytorch-ignite \
         PyYAML \
-        scikit-learn==1.1.3 \
+        safetensors \
+        scikit-learn \
         scipy==1.8.1 \
         spconv \
         sphinx \
         sphinx-autodoc-typehints \
+        sphinx-copybutton \
+        sphinx-design \
         sphinx-jinja \
         sphinx-rtd-theme \
-        tensorboard==2.4.0 \
-        tensorboardX==2.4 \
+        sphinx-tabs \
+        tensorboard \
         timm==0.4.12 \
         torch==2.1.2+cpu -f https://download.pytorch.org/whl/torch_stable.html \
-        torchaudio==2.1.2 -f https://download.pytorch.org/whl/torch_stable.html \
+        torchaudio==2.1.2+cpu -f https://download.pytorch.org/whl/torch_stable.html \
         torchtext \
         torchvision==0.16.2+cpu -f https://download.pytorch.org/whl/torch_stable.html \
         tqdm \
-        transformers==4.27.4 \
+        transformers \
         wget && \
     python3 -m ipykernel.kernelspec
 
@@ -220,8 +222,6 @@ RUN wget -q https://github.com/opencv/opencv/archive/refs/tags/3.4.19.tar.gz -O 
 EXPOSE 25000
 RUN apt-get update && apt-get install -y openssh-server && rm -rf /var/lib/apt/lists/*
 RUN mkdir /var/run/sshd
-
-RUN apt-get update && apt-get install -y liblapacke liblapacke-dev && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y libjpeg8-dev && \
     rm -rf /var/lib/apt/lists/*

@@ -58,8 +58,8 @@ update-alternatives --set python3 /usr/bin/python3.10
 # GPU varients
 if [[ "$AIMET_VARIANT" == *"gpu"* ]]; then
 
-    #. PyTorch 1.13 GPU variant or ONNX variant: `CUDA Toolkit 11.7.1 <https://developer.nvidia.com/cuda-11-7-1-download-archive>`_
-    if [[ "$AIMET_VARIANT" == *"pt113"* || "$AIMET_VARIANT" == *"onnx"* ]]; then
+    #. or ONNX variant: `CUDA Toolkit 11.7.1 <https://developer.nvidia.com/cuda-11-7-1-download-archive>`_
+    if [[ "$AIMET_VARIANT" == *"onnx"* ]]; then
         wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-ubuntu2204.pin
         mv cuda-ubuntu2204.pin /etc/apt/preferences.d/cuda-repository-pin-600
         wget https://developer.download.nvidia.com/compute/cuda/11.7.1/local_installers/cuda-repo-ubuntu2204-11-7-local_11.7.1-515.65.01-1_amd64.deb

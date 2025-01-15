@@ -52,7 +52,7 @@ from aimet_torch import utils
 from aimet_torch.gptvq.defs import GPTVQSupportedModules, GPTVQParameters
 from aimet_torch.gptvq.gptvq_optimizer import GPTVQOptimizer
 from aimet_torch.gptvq.utils import get_module_name_to_hessian_tensor
-from aimet_torch.quantsim import ExportableQuantModule
+from aimet_torch._base.quantsim import _QuantizedModuleProtocol
 from aimet_torch.save_utils import SaveUtils
 from aimet_torch.utils import get_named_module
 from aimet_torch.v2.nn import BaseQuantizationMixin
@@ -391,7 +391,7 @@ class GPTVQ:
             json.dump(encoding, encoding_fp, sort_keys=True, indent=4)
 
     @staticmethod
-    def _update_param_encodings_dict(quant_module: ExportableQuantModule,
+    def _update_param_encodings_dict(quant_module: _QuantizedModuleProtocol,
                                      name: str,
                                      param_encodings: Dict,
                                      rows_per_block: int):
@@ -403,7 +403,7 @@ class GPTVQ:
         :param param_encodings: Dictionary of param encodings
         :param rows_per_block: The number of rows per block
         """
-        for orig_param_name, encodings in quant_module.export_param_encodings().items():
+        for orig_param_name, encodings in quant_module.export_param_encodings(encoding_version='0.6.1').items():
             if orig_param_name == "weight" and encodings:
                 per_channel_encodings = []
                 # Transform block encodings to per-channel encodings

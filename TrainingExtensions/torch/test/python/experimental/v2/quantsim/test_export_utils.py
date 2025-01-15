@@ -45,12 +45,12 @@ import tempfile
 
 import torch
 from aimet_common import quantsim
-from aimet_torch.examples.test_models import SingleResidualWithAvgPool
 from aimet_torch.experimental.v2.quantsim.export_utils import EncodingType
-from aimet_torch.quantsim import QuantizationSimModel as QuantizationSimModelV1, QuantizationDataType
+from aimet_torch.v1.quantsim import QuantizationSimModel as QuantizationSimModelV1, QuantizationDataType
 from aimet_torch.v2.quantsim import QuantizationSimModel as QuantizationSimModelV2
 from aimet_torch.v2.quantization.base import QuantizerBase
 from aimet_torch.v2.quantization.affine.quantizer import QuantizeDequantize, GroupedBlockQuantizeDequantize
+from ....models.test_models import SingleResidualWithAvgPool
 
 @contextmanager
 def swap_encoding_version(version='1.0.0'):
@@ -296,15 +296,3 @@ def test_export_1_0_0_bq_lpbq():
     assert conv_weight_encoding['block_size'] == 8
     assert len(conv_weight_encoding['per_block_int_scale']) == 64
     assert conv_weight_encoding['compressed_bw'] == 4
-
-
-def test_invalid_cases():
-    model = SingleResidualWithAvgPool().eval()
-    dummy_inp = torch.randn(1, 3, 32, 32)
-    qsim = QuantizationSimModelV2(model, dummy_input=dummy_inp, default_param_bw=4)
-    qsim.model.conv1.input_quantizers[0] = QuantizeDequantize(shape=(1, 3, 1, 1), bitwidth=8, symmetric=False)
-    qsim.compute_encodings(lambda m, _: m(dummy_inp), None)
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        with swap_encoding_version():
-            with pytest.raises(AssertionError):
-                qsim.export(tmp_dir, 'qsim_export', dummy_inp)
