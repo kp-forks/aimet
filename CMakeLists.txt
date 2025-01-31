@@ -109,8 +109,14 @@ if (ENABLE_TORCH AND ENABLE_TENSORFLOW)
 endif()
 
 # Find Python libraries
+execute_process(
+    COMMAND python3 -V       # "Python 3.XX.YY\n"
+    COMMAND cut -d " " -f 2  # "3.XX.YY\n"
+    COMMAND head -c -1       # "3.XX.YY"
+    OUTPUT_VARIABLE Python3_VERSION
+)
 set(Python3_FIND_VIRTUALENV "STANDARD")
-find_package(Python3 COMPONENTS Interpreter Development)
+find_package(Python3 ${Python3_VERSION} EXACT COMPONENTS Interpreter Development)
 message(STATUS "Found Python3: ${Python3_FOUND}, at ${Python3_LIBRARIES}")
 
 # -------------------------------
@@ -145,6 +151,16 @@ if (ENABLE_TENSORFLOW)
     endif()
 endif()
 
+if(DEFINED CMAKE_CXX_FLAGS)
+    if(NOT CMAKE_CXX_FLAGS MATCHES "-O(0|1|2|3|s|fast)")
+        message(NOTICE "No optimization flag found. Setting optimization to -O3.")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
+    endif()
+else()
+    message(NOTICE "CMAKE_CXX_FLAGS not defined. Setting optimization to -O3.")
+    set(CMAKE_CXX_FLAGS "-O3")
+endif()
+
 if (ENABLE_GCC_PRE_CXX11_ABI)
     message(NOTICE "Adding to CXXFLAGS: -D_GLIBCXX_USE_CXX11_ABI=0")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
@@ -163,7 +179,7 @@ endif()
 find_package(Threads)
 
 find_package(PkgConfig)
-pkg_search_module(LAPACKE REQUIRED lapacke)
+find_package (Eigen3 REQUIRED)
 
 #find_package(OpenCV REQUIRED)
 pkg_search_module(OPENCV opencv) # in case opencv will not be found, it would be built form source
@@ -184,7 +200,6 @@ if (ENABLE_ONNX)
     set_onnxruntime_variables()
     set_torch_cmake_prefix_path()
 
-    find_package(Eigen3 REQUIRED)
 endif()
 
 if (ENABLE_TENSORFLOW)

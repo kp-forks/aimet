@@ -42,14 +42,14 @@ add_library(MoDlCompression STATIC
       )
 
 target_include_directories(MoDlCompression
-      PRIVATE ${LAPACKE_INCLUDE_DIRS} ${OPENCV_INCLUDE_DIRS}
+      PRIVATE ${EIGEN3_INCLUDE_DIR} ${OPENCV_INCLUDE_DIRS}
       PUBLIC
          ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 target_link_libraries(MoDlCompression PUBLIC
     pybind11
-    ${LAPACKE_LINK_LIBRARIES}
     ${OPENCV_LINK_LIBRARIES}
+    z
     )
 
 target_compile_options(MoDlCompression
@@ -59,11 +59,16 @@ target_compile_options(MoDlCompression
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/DlCompression
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/x86_64-linux-gnu/include)
-
 if (ENABLE_TESTS)
     add_subdirectory(test)
 endif()
 
-whl_add_whl_prep_common_target(DlCompression)
+if (SKBUILD)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/DlCompression
+            DESTINATION aimet_common/x86_64-linux-gnu/include)
+else (SKBUILD)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/DlCompression
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}/x86_64-linux-gnu/include)
+
+    whl_add_whl_prep_common_target(DlCompression)
+endif (SKBUILD)

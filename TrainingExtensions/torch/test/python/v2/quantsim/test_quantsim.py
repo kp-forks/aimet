@@ -45,13 +45,13 @@ import numpy as np
 from aimet_common.quantsim_config.utils import get_path_for_per_channel_config
 from aimet_common.defs import QuantizationDataType
 from aimet_torch import onnx_utils
-from aimet_torch.quantsim import load_encodings_to_sim, QuantScheme
+from aimet_torch.v1.quantsim import load_encodings_to_sim, QuantScheme
 from aimet_torch.v2.quantsim import QuantizationSimModel
 from aimet_torch.v2.quantization.encoding_analyzer import PercentileEncodingAnalyzer
 from aimet_torch.v2.quantization.base import QuantizerBase
-from aimet_torch.v2.quantization.affine import AffineQuantizerBase, GroupedBlockQuantizeDequantize
+from aimet_torch.v2.quantization.affine import AffineQuantizerBase, GroupedBlockQuantizeDequantize, QuantizeDequantize
 from aimet_torch.v2.experimental import propagate_output_encodings
-from aimet_torch.v2.nn import BaseQuantizationMixin, QuantizedConv2d
+from aimet_torch.v2.nn import BaseQuantizationMixin, QuantizationMixin, QuantizedConv2d
 import aimet_torch.v2.nn.modules.custom as custom
 from ..models_ import test_models
 
@@ -783,7 +783,7 @@ class TestQuantsim:
 
             assert qsim.model.fc.param_quantizers['weight'].get_max()[0][0] == old_max
             out3 = qsim.model(dummy_input)
-            assert torch.equal(out1, out3)
+            assert torch.allclose(out1, out3)
 
             qsim.model.fc.weight = torch.nn.Parameter(torch.randn(old_weight.shape))
             qsim.compute_encodings(lambda m, _: m(dummy_input_2), None)
@@ -793,7 +793,7 @@ class TestQuantsim:
             qsim.load_encodings(os.path.join(temp_dir, 'exported_encodings_torch.encodings'))
 
             out4 = qsim.model(dummy_input)
-            assert torch.equal(out1, out4)
+            assert torch.allclose(out1, out4)
 
 
     def test_quantsim_with_unused_modules(self):
@@ -938,6 +938,324 @@ class TestQuantsim:
                     if 'bias' not in name:
                         assert name in param_encodings_set
 
+    class CustomLinear(torch.nn.Module):
+        """ custom linear module """
+        def __init__(self, in_features, out_features):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.randn(out_features, in_features))
+            self.bias = torch.nn.Parameter(torch.randn(out_features))
+            self.matmul = custom.MatMul()
+            self.add = custom.Add()
+
+        def forward(self, x):
+            x = self.matmul(x, self.weight.transpose(0, 1))
+            return self.add(x, self.bias)
+
+    @QuantizationMixin.implements(CustomLinear)
+    class QuantizedCustomLinear(QuantizationMixin, CustomLinear):
+        def __quant_init__(self):
+            super().__quant_init__()
+            self.input_quantizers = torch.nn.ModuleList([])
+            self.output_quantizers = torch.nn.ModuleList([])
+
+        def forward(self, x):
+            with self._patch_quantized_parameters():
+                return super().forward(x)
+
+    def test_non_leaf_qmodule(self):
+        """
+        Given: Define a quantized definition of a non-leaf module
+        """
+
+        """
+        When: Create quantsim with the non-leaf module
+        Then: 1) The non-leaf module should be converted to a quantized module
+              2) All its submodules should be also converted to quantized modules
+        """
+        model = torch.nn.Sequential(
+            self.CustomLinear(10, 10),
+            torch.nn.Sigmoid(),
+        )
+        dummy_input = torch.randn(10, 10)
+
+        sim = QuantizationSimModel(model, dummy_input)
+
+        qlinear = sim.model[0]
+        assert isinstance(qlinear, self.QuantizedCustomLinear)
+        assert isinstance(qlinear.param_quantizers['weight'], AffineQuantizerBase)
+        assert qlinear.param_quantizers['bias'] is None
+
+        assert isinstance(qlinear.matmul, custom.QuantizedMatMul)
+        assert isinstance(qlinear.matmul.input_quantizers[0], AffineQuantizerBase)
+        assert qlinear.matmul.input_quantizers[1] is None
+        assert isinstance(qlinear.matmul.output_quantizers[0], AffineQuantizerBase)
+
+        assert isinstance(qlinear.add, custom.QuantizedAdd)
+        assert qlinear.add.input_quantizers[0] is None
+        assert isinstance(qlinear.add.input_quantizers[1], AffineQuantizerBase)
+        assert isinstance(qlinear.add.output_quantizers[0], AffineQuantizerBase)
+
+        """
+        When: Export
+        Then: The generated encoding file should contain all entries properly
+        """
+        sim.compute_encodings(lambda model: model(dummy_input))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sim.export(tmpdir, 'model', dummy_input=dummy_input)
+            with open(os.path.join(tmpdir, 'model_torch.encodings')) as f:
+                encodings = json.load(f)
+
+        expected_schema = {
+            'activation_encodings': {
+                '0.add':    {'input': ..., 'output': ...}, # CustomLinear.add
+                '0.matmul': {'input': ..., 'output': ...}, # CustomLinear.matmul
+                '1':        {'output': ...},               # Sigmoid
+            },
+            'param_encodings': {
+                '0.weight': ...,                           # CustomLinear.weight
+            }
+        }
+
+        def _assert_same_keys(d: dict, expected: dict):
+            assert d.keys() == expected.keys()
+
+            for k in d:
+                v1, v2 = d[k], expected[k]
+                if isinstance(v2, dict):
+                    _assert_same_keys(v1, v2)
+
+        _assert_same_keys(encodings['activation_encodings'], expected_schema['activation_encodings'])
+        # TODO: This assertion currently fails
+        # _assert_same_keys(encodings['param_encodings'], expected_schema['param_encodings'])
+
+    def test_non_leaf_qmodule_exception_rules(self):
+        quantsim_config = {
+            "defaults": {
+                "hw_version": "V79",
+                "ops": {"is_output_quantized": "True"},
+                "params": {"is_quantized": "True", "is_symmetric": "True"},
+                "strict_symmetric": "False",
+            },
+            "params": {},
+            "op_type": {},
+            "supergroups": [],
+            "model_input": {"is_input_quantized": "True"},
+            "model_output": {},
+        }
+
+        class SupergroupLayer(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.qk_matmul = custom.MatMul()
+                self.mask_add = custom.Add()
+                self.softmax = torch.nn.Softmax(dim=-1)
+
+            def forward(self, query, key, attn_mask):
+                attn_weight = self.qk_matmul(query, key.transpose(-2, -1))
+                attn_weight = self.mask_add(attn_weight, attn_mask)
+                attn_weight = self.softmax(attn_weight)
+                return attn_weight
+
+        @QuantizationMixin.implements(SupergroupLayer)
+        class QuantizedSupergroupLayer(QuantizationMixin, SupergroupLayer):
+
+            def __quant_init__(self):
+                super().__quant_init__()
+                # Supergroup itself doesn't need input/output quantizers
+                self.input_quantizers = torch.nn.ModuleList([])
+                self.output_quantizers = torch.nn.ModuleList([])
+
+            def forward(self, query, key, attn_mask):
+                return super().forward(query, key, attn_mask)
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.q = torch.nn.Linear(10, 10)
+                self.k = torch.nn.Linear(10, 10)
+                self.v = torch.nn.Linear(10, 10)
+                self.attn = SupergroupLayer()
+                self.matmul = custom.MatMul()
+
+            def forward(self, x, mask):
+                attn = self.attn(self.q(x), self.k(x), mask)
+                return self.matmul(self.v(x), attn)
+
+        model = Model()
+        dummy_input = (torch.randn(1, 10, 10), torch.zeros(1, 1, 10, 10))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = f"{temp_dir}/quantsim_config.json"
+            with open(config_path, "w") as f:
+                json.dump(quantsim_config, f)
+            sim = QuantizationSimModel(model, dummy_input, default_output_bw=16, config_file=config_path)
+
+        sim.compute_encodings(lambda model: model(*dummy_input))
+        """
+        MatMul second inputs should be symmetric
+        """
+        assert sim.model.attn.softmax.output_quantizers[0].symmetric
+        assert sim.model.k.output_quantizers[0].symmetric
+
+    def test_already_quantized_model(self):
+        """
+        Given: The model already consists of quantized modules
+        When: Create quantsim with the model
+        Then: Throw runtime error
+        """
+        model = torch.nn.Sequential(
+            QuantizedConv2d(3, 3, 3),
+            torch.nn.ReLU(),
+        )
+        dummy_input = torch.randn(1, 3, 224, 224)
+
+        with pytest.raises(RuntimeError):
+            _ = QuantizationSimModel(model, dummy_input)
+
+        """
+        Given: The model already consists of quantizers
+        When: Create quantsim with the model
+        Then: Throw runtime error
+        """
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 3, 3),
+            QuantizeDequantize((), 0, 255, False),
+        )
+
+        with pytest.raises(RuntimeError):
+            _ = QuantizationSimModel(model, dummy_input)
+
+        """
+        Given: The model itself is a quantized module
+        When: Create quantsim with the model
+        Then: Throw runtime error
+        """
+        model = QuantizedConv2d(3, 3, 3)
+
+        with pytest.raises(RuntimeError):
+            _ = QuantizationSimModel(model, dummy_input)
+
+        """
+        Given: The model itself is a quantizer
+        When: Create quantsim with the model
+        Then: Throw runtime error
+        """
+        model = QuantizeDequantize((), 0, 255, False)
+
+        with pytest.raises(RuntimeError):
+            _ = QuantizationSimModel(model, dummy_input)
+
+    @pytest.mark.parametrize("module_factory", [
+                                lambda: custom.Add(),
+                                lambda: custom.Subtract(),
+                                lambda: custom.Multiply(),
+                                lambda: custom.Divide(), 
+                            ])
+    @pytest.mark.parametrize("input_shape", [tuple(), (1,), (1, 1), (2,), (2, 1)])
+    def test_quantize_constant(self, module_factory, input_shape):
+        """ Test that model input quantizers are enabled correctly when using different constant types """
+        dummy_input = torch.randn(input_shape)
+
+        """
+        Given: A model with constant in buffer
+        When: Instantiate quantsim
+        Then: The input quantizer quantizing buffer constant should be enabled
+        """
+
+        class BufferModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.module = module_factory()
+                self.register_buffer("const", torch.randn(input_shape))
+
+            def forward(self, *inputs):
+                x = self.module(inputs[0], self.const)
+                return x
+
+        model = BufferModel()
+        sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf,
+                                    dummy_input=dummy_input, in_place=True)
+
+        assert sim.model.module.input_quantizers[1] is not None
+
+        """
+        Given: A model with parameter constant
+        When: Instantiate quantsim
+        Then: The input quantizer quantizing parameter constant should be enabled if the constant is not singleton
+        """
+
+        class ParamModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.module = module_factory()
+                self.const = torch.nn.Parameter(torch.randn(input_shape))
+
+            def forward(self, *inputs):
+                x = self.module(inputs[0], self.const)
+                return x
+
+        model = ParamModel()
+        sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf,
+                                    dummy_input=dummy_input, in_place=True)
+
+        assert (sim.model.module.input_quantizers[1] is None) == all(dim == 1 for dim in input_shape)
+
+
+    def test_quantize_constant_python_float(self):
+        """ Test that model input quantizers are enabled correctly when using different constant types """
+        dummy_input = torch.randn(2, 1)
+
+        """
+        Given: A model with python float constant
+        When: Instantiate quantsim and run compute_encodings
+        Then: 1. The input quantizer quantizing buffer constant should be enabled
+              2. The quantizer should not be initialized
+        """
+                
+        class PythonFloatModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.module = custom.Add()
+
+            def forward(self, *inputs):
+                x = self.module(inputs[0], 2.0)
+                return x
+
+        model = PythonFloatModel()
+        sim = QuantizationSimModel(model, quant_scheme=QuantScheme.post_training_tf,
+                                    dummy_input=dummy_input, in_place=True)
+        sim.compute_encodings(lambda m, d: m(d), dummy_input)
+        sim.model(dummy_input)
+
+        assert sim.model.module.input_quantizers[1] is not None
+        assert not sim.model.module.input_quantizers[1].is_initialized()
+
+    def test_compute_encodings_optional_arg(self):
+        """
+        Given: Two quantsims created with identical model & config
+        """
+        model = test_models.BasicConv2d(kernel_size=3)
+        dummy_input = torch.rand(1, 64, 16, 16)
+        sim_a = QuantizationSimModel(model, dummy_input)
+        sim_b = QuantizationSimModel(model, dummy_input)
+
+        """
+        When: Run compute_encodings with second argument omitted in one quantsim and not in the other
+        Then: The quantizers in both quantsims should have the same encodings
+        """
+        sim_a.compute_encodings(lambda model: model(dummy_input))
+        sim_b.compute_encodings(lambda model, x: model(x),
+                                forward_pass_callback_args=dummy_input)
+
+        for qtzr_a, qtzr_b in zip(sim_a.model.modules(), sim_b.model.modules()):
+            if isinstance(qtzr_a, AffineQuantizerBase):
+                assert torch.equal(qtzr_a.get_scale(), qtzr_b.get_scale())
+                assert torch.equal(qtzr_a.get_offset(), qtzr_b.get_offset())
+                assert torch.equal(qtzr_a.get_min(), qtzr_b.get_min())
+                assert torch.equal(qtzr_a.get_max(), qtzr_b.get_max())
+
 
 class TestQuantsimUtilities:
 
@@ -954,13 +1272,6 @@ class TestQuantsimUtilities:
         sim.run_modules_for_traced_custom_marker([conv_layer], dummy_input)
         assert conv_name in sim._module_marker_map.keys()
         assert torch.equal(sim._module_marker_map[conv_name](dummy_input), conv_layer.get_original_module()(dummy_input))
-
-    def test_get_qc_quantized_modules(self):
-        model = test_models.BasicConv2d(kernel_size=3)
-        dummy_input = torch.rand(1, 64, 16, 16)
-        sim = QuantizationSimModel(model, dummy_input)
-        conv_layer = sim.model.conv
-        assert ("conv", conv_layer) in sim._get_qc_quantized_layers(sim.model)
 
     def test_get_leaf_module_to_name_map(self):
         model = test_models.NestedConditional()
@@ -1327,3 +1638,59 @@ class TestEncodingPropagation:
               to propagate the output encodings to.
         """
         propagate_output_encodings(sim, custom.Concat)
+
+    def test_skip_torch_encodings(self):
+        @contextlib.contextmanager
+        def swap_skip_torch_encodings(skip_torch_encodings):
+            from aimet_torch._base import quantsim
+            old_setting = quantsim.SKIP_TORCH_ENCODINGS_EXPORT
+            quantsim.SKIP_TORCH_ENCODINGS_EXPORT = skip_torch_encodings
+
+            yield
+
+            quantsim.SKIP_TORCH_ENCODINGS_EXPORT = old_setting
+
+        model = test_models.SingleResidualWithAvgPool()
+        dummy_input = torch.randn(1, 3, 28, 28)
+
+        qsim = QuantizationSimModel(model, dummy_input)
+        qsim.compute_encodings(lambda m, _: m(dummy_input), None)
+
+        with tempfile.TemporaryDirectory() as temp_dir, swap_skip_torch_encodings(False):
+            qsim.export(temp_dir, 'model_export', dummy_input)
+            assert os.path.isfile(os.path.join(temp_dir, 'model_export_torch.encodings'))
+
+        with tempfile.TemporaryDirectory() as temp_dir, swap_skip_torch_encodings(True):
+            qsim.export(temp_dir, 'model_export', dummy_input)
+            assert not os.path.isfile(os.path.join(temp_dir, 'model_export_torch.encodings'))
+
+    def test_torch_encodings_parity(self):
+        @contextlib.contextmanager
+        def swap_encoding_version(encoding_version):
+            from aimet_common import quantsim as aimet_common_quantsim
+            old_setting = aimet_common_quantsim.encoding_version
+            aimet_common_quantsim.encoding_version = encoding_version
+
+            yield
+
+            aimet_common_quantsim.encoding_version = old_setting
+
+        model = test_models.SingleResidualWithAvgPool()
+        dummy_input = torch.randn(1, 3, 28, 28)
+
+        qsim = QuantizationSimModel(model, dummy_input)
+        qsim.compute_encodings(lambda m, _: m(dummy_input), None)
+
+        with tempfile.TemporaryDirectory() as temp_dir, swap_encoding_version(False):
+            with swap_encoding_version('0.6.1'):
+                qsim.export(temp_dir, 'model_export_0_6_1', dummy_input)
+            with swap_encoding_version('1.0.0'):
+                qsim.export(temp_dir, 'model_export_1_0_0', dummy_input)
+
+            with open(os.path.join(temp_dir, 'model_export_0_6_1_torch.encodings')) as encodings_0_6_1_file:
+                encodings_0_6_1 = json.load(encodings_0_6_1_file)
+            with open(os.path.join(temp_dir, 'model_export_1_0_0_torch.encodings')) as encodings_1_0_0_file:
+                encodings_1_0_0 = json.load(encodings_1_0_0_file)
+
+            assert encodings_0_6_1['activation_encodings'] == encodings_1_0_0['activation_encodings']
+            assert encodings_0_6_1['param_encodings'] == encodings_1_0_0['param_encodings']

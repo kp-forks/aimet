@@ -42,7 +42,6 @@ import copy
 import torch
 import torch.nn
 import numpy as np
-import aimet_common.libpymo as libpymo
 
 from aimet_common.graph_pattern_matcher import PatternType
 from aimet_common.graph_searcher import GraphSearcher
@@ -56,16 +55,14 @@ from aimet_common.bias_correction import (
 from aimet_common.defs import ActivationType
 
 from aimet_torch import utils
-from aimet_torch import quantsim as qsim
+from aimet_torch.quantsim import QuantizationSimModel
+from aimet_torch._base.quantsim import _QuantizedModuleProtocol, QuantParams
 from aimet_torch.meta.connectedgraph import ConnectedGraph
-from aimet_torch.quantsim import QcQuantizeWrapper
 from aimet_torch.save_utils import SaveUtils
 from aimet_torch.utils import get_ordered_lists_of_conv_fc
+from aimet_torch.v2.nn.base import BaseQuantizationMixin
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
-
-# Temporary flag to flip underlying implementation. This flag will be removed in the future releases.
-USE_PYTHON_IMPL = True
 
 class StopForwardException(Exception):
     """ Dummy exception to early-terminate forward-pass """
@@ -95,12 +92,15 @@ def get_quantized_dequantized_weight(layer: torch.nn.Module) -> torch.Tensor:
     :return: quantized dequantized weights
     """
     # pylint: disable=protected-access
-    weight_tensor = layer._module_to_wrap.weight
+    weight_tensor = layer.weight
     weight_quantizer = layer.param_quantizers['weight']
 
-    quant_dequant_weights = weight_quantizer.quantize_dequantize(weight_tensor, weight_quantizer.round_mode)
+    # v2 quantizer
+    if callable(weight_quantizer):
+        return weight_quantizer(weight_tensor)
 
-    return quant_dequant_weights
+    # v1 quantizer
+    return weight_quantizer.quantize_dequantize(weight_tensor, weight_quantizer.round_mode)
 
 
 def register_fwd_hook_for_layer(layer: torch.nn.Module, hook: Callable) -> torch.utils.hooks.RemovableHandle:
@@ -150,9 +150,9 @@ def get_output_data(layer: torch.nn.Module, model: torch.nn.Module, images_in_on
     return output_data
 
 
-def call_empirical_py_correct_bias(layer: torch.nn.Module,
-                                   reference_outputs: np.ndarray,
-                                   quantized_outputs: np.ndarray):
+def call_empirical_correct_bias(layer: torch.nn.Module,
+                                reference_outputs: np.ndarray,
+                                quantized_outputs: np.ndarray):
     """
     Empirical bias correction using python.
 
@@ -169,51 +169,9 @@ def call_empirical_py_correct_bias(layer: torch.nn.Module,
                                                                             dtype=layer.bias.dtype)
 
 
-def call_empirical_mo_correct_bias(layer: torch.nn.Module,
-                                   reference_outputs: np.ndarray,
-                                   quantized_outputs: np.ndarray):
-    """
-    Empirical bias correction using MO.
-
-    :param layer:
-    :param reference_outputs:
-    :param quantized_outputs:
-    """
-    bias_correction = libpymo.BiasCorrection()
-    bias_correction.storePreActivationOutput(reference_outputs)
-    bias_correction.storeQuantizedPreActivationOutput(quantized_outputs)
-
-    bias_tensor = libpymo.TensorParamBiasCorrection()
-    bias_tensor.data = layer.bias.detach().cpu().numpy()
-
-    bias_correction.correctBias(bias_tensor)
-
-    # update the bias param.
-    with torch.no_grad():
-        layer.bias.copy_(torch.Tensor(bias_tensor.data).reshape_as(layer.bias)).to(device=layer.bias.device,
-                                                                                   dtype=layer.bias.dtype)
-
-
-def call_empirical_correct_bias(layer: torch.nn.Module,
-                                reference_outputs: np.ndarray,
-                                quantized_outputs: np.ndarray):
-    """
-    Empirical bias correction.
-
-    :param layer:
-    :param reference_outputs:
-    :param quantized_outputs:
-    :return:
-    """
-    if USE_PYTHON_IMPL:
-        call_empirical_py_correct_bias(layer, reference_outputs, quantized_outputs)
-    else:
-        call_empirical_mo_correct_bias(layer, reference_outputs, quantized_outputs)
-
-
-def call_analytical_py_correct_bias(layer: torch.nn.Module,
-                                    bn: Union[torch.nn.BatchNorm2d, None],
-                                    activation_type: Union[ActivationType, None]):
+def call_analytical_correct_bias(layer: torch.nn.Module,
+                                 bn: Union[torch.nn.BatchNorm2d, None],
+                                 activation_type: Union[ActivationType, None]):
     """
     Analytical bias correction using python.
 
@@ -257,73 +215,7 @@ def call_analytical_py_correct_bias(layer: torch.nn.Module,
                                                                             dtype=layer.bias.dtype)
 
 
-def call_analytical_mo_correct_bias(layer: torch.nn.Module, bn: Union[torch.nn.BatchNorm2d, None],
-                                    activation_type: Union[ActivationType, None]):
-    """
-    Analytical bias correction using MO.
-
-    :param layer: Layer to be corrected
-    :param bn: Input BN to layer
-    :param activation_type: Input activation to layer
-    """
-    quant_dequant_weight = get_quantized_dequantized_weight(layer)
-    layer = layer.get_original_module()
-
-    # Transpose weights to C, N, H, W from N, C, H, W since axis are flipped for transposed conv
-    weight_tensor = layer.weight
-    if isinstance(layer, torch.nn.ConvTranspose2d) and layer.groups == 1:
-        weight_tensor = weight_tensor.permute(1, 0, 2, 3)
-        quant_dequant_weight = quant_dequant_weight.permute(1, 0, 2, 3)
-
-    quant_dequant_weight = quant_dequant_weight.detach().cpu().numpy()
-    weight_tensor = weight_tensor.detach().cpu().numpy()
-
-    bias_tensor = libpymo.TensorParamBiasCorrection()
-    bias_tensor.data = layer.bias.detach().cpu().numpy()
-
-    # Assigning activation to No Activation
-    activation = libpymo.ActivationType.noActivation
-    bn_params = libpymo.BnParamsBiasCorr()
-    if bn is None:
-        shape = weight_tensor.shape[1]
-        bn_params.gamma = np.ones(shape)
-        bn_params.beta = np.zeros(shape)
-    else:
-        bn_params.gamma = bn.get_module().weight.detach().cpu().numpy()
-        bn_params.beta = bn.get_module().bias.detach().cpu().numpy()
-
-        if activation_type == ActivationType.relu:
-            activation = libpymo.ActivationType.relu
-        # Relu6's type in connected graph is hardtanh
-        elif activation_type == ActivationType.relu6:
-            activation = libpymo.ActivationType.relu6
-
-    bias_correction = libpymo.BnBasedBiasCorrection()
-    bias_correction.correctBias(bias_tensor, quant_dequant_weight, weight_tensor, bn_params, activation)
-
-    # update the bias param.
-    with torch.no_grad():
-        layer.bias.copy_(torch.Tensor(bias_tensor.data).reshape_as(layer.bias)).to(device=layer.bias.device,
-                                                                                   dtype=layer.bias.dtype)
-
-
-def call_analytical_correct_bias(layer: torch.nn.Module,
-                                 bn: Union[torch.nn.BatchNorm2d, None],
-                                 activation_type: Union[ActivationType, None]):
-    """
-    Analytical bias correction.
-
-    :param layer:
-    :param bn:
-    :param activation_type:
-    """
-    if USE_PYTHON_IMPL:
-        call_analytical_py_correct_bias(layer, bn, activation_type)
-    else:
-        call_analytical_mo_correct_bias(layer, bn, activation_type)
-
-
-def correct_bias(model: torch.nn.Module, quant_params: qsim.QuantParams,
+def correct_bias(model: torch.nn.Module, quant_params: QuantParams,
                  num_quant_samples: int, data_loader, num_bias_correct_samples: int,
                  conv_bn_dict: Union[Dict[torch.nn.Module, ConvBnInfoType], None] = None,
                  perform_only_empirical_bias_corr: bool = True,
@@ -387,21 +279,31 @@ def correct_bias(model: torch.nn.Module, quant_params: qsim.QuantParams,
 
     # Quantize full model
     dummy_tensors = utils.create_rand_tensors_given_shapes(input_shape, utils.get_device(model))
-    q = qsim.QuantizationSimModel(model=model, quant_scheme=quant_params.quant_scheme,
-                                  rounding_mode=quant_params.round_mode,
-                                  default_output_bw=quant_params.act_bw,
-                                  default_param_bw=quant_params.weight_bw,
-                                  in_place=True,
-                                  dummy_input=dummy_tensors, config_file=quant_params.config_file)
+    q = QuantizationSimModel(model=model, quant_scheme=quant_params.quant_scheme,
+                             rounding_mode=quant_params.round_mode,
+                             default_output_bw=quant_params.act_bw,
+                             default_param_bw=quant_params.weight_bw,
+                             in_place=True,
+                             dummy_input=dummy_tensors, config_file=quant_params.config_file)
 
     # make sure  model got updated in-place before we use it for bc updates
     assert q.model is model
 
+    def disable_output_quantizers(qmodule):
+        # v2 quantized module
+        if isinstance(qmodule, BaseQuantizationMixin):
+            qmodule._remove_output_quantizers() # pylint: disable=protected-access
+            return
+
+        # v1 QcQuantizeWrapper
+        for qtzr in qmodule.output_quantizers:
+            qtzr.enabled = False
+
     # updates to skip_output_activation and layers_to_ignore
     for _, module in model.named_modules():
         # Skip all layer's output quantization
-        if isinstance(module, QcQuantizeWrapper):
-            module.output_quantizers[0].enabled = False
+        if isinstance(module, _QuantizedModuleProtocol): # pylint: disable=protected-access
+            disable_output_quantizers(module)
 
     q.compute_encodings(pass_data_through_model, None)
 
@@ -421,8 +323,6 @@ def correct_bias(model: torch.nn.Module, quant_params: qsim.QuantParams,
         if module in layers_to_ignore:
             continue
         else:
-            # make sure module is in the model used by qsim.
-            assert module in list(q.model.modules())
             # Analytical Bias Correction is only done for Conv layers
             reference_layer = utils.get_layer_by_name(model_copy, module_name)
             quantize_layer = utils.get_layer_by_name(model, module_name)

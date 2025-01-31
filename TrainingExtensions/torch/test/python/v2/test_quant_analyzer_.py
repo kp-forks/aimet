@@ -44,8 +44,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from aimet_common.defs import QuantScheme
 from aimet_common.utils import CallbackFunc
-from aimet_torch.batch_norm_fold import fold_all_batch_norms
-from models.test_models import TinyModel
+from aimet_torch.v2.batch_norm_fold import fold_all_batch_norms
+from ..models.test_models import TinyModel
 from aimet_torch.v2.nn.base import BaseQuantizationMixin
 from aimet_torch.v2.quantization.base import QuantizerBase
 from aimet_torch.v2.quantsim import QuantizationSimModel
@@ -236,7 +236,7 @@ class TestQuantAnalyzer:
         input_shape = (1, 3, 32, 32)
         dummy_input = torch.randn(*input_shape)
         model = TinyModel().eval()
-        sim = QuantizationSimModel(model, dummy_input)
+        sim = QuantizationSimModel(model, dummy_input, quant_scheme=QuantScheme.post_training_tf_enhanced)
         sim.compute_encodings(evaluate, dummy_input)
         forward_pass_callback = CallbackFunc(calibrate, dummy_input)
         eval_callback = CallbackFunc(evaluate, dummy_input)
@@ -276,7 +276,8 @@ class TestQuantAnalyzer:
             input_shape = (1, 3, 32, 32)
             dummy_input = torch.randn(*input_shape)
             model = TinyModel().eval()
-            sim = QuantizationSimModel(model, dummy_input, config_file=os.path.join(tmp_dir, "quantsim_config.json"))
+            sim = QuantizationSimModel(model, dummy_input, config_file=os.path.join(tmp_dir, "quantsim_config.json"),
+                                       quant_scheme=QuantScheme.post_training_tf_enhanced)
             sim.compute_encodings(evaluate, dummy_input)
             forward_pass_callback = CallbackFunc(calibrate, dummy_input)
             eval_callback = CallbackFunc(evaluate, dummy_input)

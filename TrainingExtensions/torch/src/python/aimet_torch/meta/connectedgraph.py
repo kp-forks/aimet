@@ -44,6 +44,8 @@ result of an operation. Furthermore the graph representation is bi-directional."
 
 import copy
 from collections import defaultdict
+from types import SimpleNamespace
+import inspect
 from typing import Tuple, Union, List, Dict, Type, Optional
 import torch
 
@@ -53,7 +55,7 @@ from aimet_common.connected_graph.product import Product
 from aimet_common.connected_graph.operation import determine_preceding_op_input_product_index_in_multi_input_op
 from aimet_common.model_module import PytorchModelModule
 from aimet_common.utils import AimetLogger
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 from aimet_torch.meta.operation import Op
 from aimet_torch.utils import is_leaf_module, run_hook_for_layers_with_given_input, in_eval_mode, \
     is_torch_nn_leaf_module, is_custom_leaf_module, get_torch_tensortype_shape
@@ -83,7 +85,8 @@ op_inputs_dict = {
 # When traced, the leaf level module for these ops may have ordering of inputs flipped. We trace into these modules in
 # order to determine the true input ordering.
 MULTI_INPUT_OPS_TO_PARSE = [aimet_modules.Add, aimet_modules.Multiply, aimet_modules.Subtract,
-                            aimet_modules.Divide, aimet_modules.Pow, aimet_modules.IndexSelect]
+                            aimet_modules.Divide, aimet_modules.Pow, aimet_modules.IndexSelect, aimet_modules.MatMul,
+                            aimet_modules.Concat, aimet_modules.Minimum, aimet_modules.DynamicConv2d]
 
 # We want to consider following operations as leaf nodes while creating op for connected graph.
 SKIP_LIST_FOR_SUBGRAPH_TRACE = [aimet_modules.StridedSlice, aimet_modules.GatherNd, aimet_modules.ScatterND,
@@ -136,6 +139,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         either module or functional) as producers and consumers of tensors.
         Note that the graph has two kinds of nodes: operations and products."""
 
+    # pylint: disable=too-many-instance-attributes
     def __init__(self, model: torch.nn.Module, model_input: Union[torch.Tensor, Tuple]):
         """
         Init function for connected graph.
@@ -154,9 +158,17 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         # Counts number of constant inputs there are in the graph
         self._constant_count = 0
 
+        self._input_structure = None
+        self._output_structure = None
+
         self._generate_module_lookup_table(model)
         with in_eval_mode(model), torch.no_grad():
+            self._aimet_defined_modules = \
+                tuple(classtype for _, classtype in inspect.getmembers(aimet_modules,
+                                                                       lambda m: inspect.isclass(m) and issubclass(m,
+                                                                                                                   torch.nn.Module)))
             self._construct_graph(model, model_input)
+            del self._aimet_defined_modules
 
         # List of ops in the order they are traversed using the forward function
         self.ordered_ops = self._get_ordered_ops()
@@ -283,6 +295,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         module_tensor_shapes_map = ConnectedGraph._generate_module_tensor_shapes_lookup_table(model, model_input)
         trace = torch.jit.trace(model, model_input, **jit_trace_args)
         self._parse_top_level_trace(trace, model)
+        self._recover_input_output_structure()
         self._optimize_connected_graph()
         self._transform_ops_and_products_to_connected_graph_convention()
         self._fill_op_and_product_properties(module_tensor_shapes_map)
@@ -478,6 +491,8 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             op = self._create_new_multi_output_op('Constant', residing_module=residing_module)
             # pylint: disable=unnecessary-comprehension
             self._add_products_for_op(op, [inp for inp in node.inputs()], outputs, output_map)
+            if isinstance(subgraph_model, torch.nn.Parameter):
+                op.output_products[0].is_parm = True
             for output in outputs:
                 curr_level_tensors.append(output)
             return
@@ -685,6 +700,89 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             op.model_module = PytorchModelModule(op_module)
         return op
 
+    def _recover_input_output_structure(self):
+        """
+        pass through constructed graph to recover structure of input and output tensors. Creates a map of each input
+        tensor to its first consumer op, and each output tensor to its last producer op.
+        """
+        def get_index_in_op_inputs(op, product):
+            if not op:
+                return None
+            return SimpleNamespace(op=op, index=op.inputs.index(product))
+
+        def get_index_in_op_outputs(op, product):
+            if not op:
+                return None
+            return SimpleNamespace(op=op, index=op.output_products.index(product))
+
+        def flatten_unpack_consumers(construct_op: Op):
+            collapsed_outputs = []
+            for product in construct_op.output_products:
+                consumers = [flatten_unpack_consumers(consumer) \
+                                 if consumer and consumer.type in ['TupleUnpack', 'ListUnpack'] \
+                                 else get_index_in_op_inputs(consumer, product) for consumer in product.consumers]
+                collapsed_outputs.append(consumers if len(consumers) > 0 else None)
+            return collapsed_outputs
+
+        def flatten_pack_producers(deconstruct_op: Op):
+            return [flatten_pack_producers(product.producer) \
+                        if product.producer and product.producer.type in ['TupleConstruct', 'ListConstruct'] \
+                        else get_index_in_op_outputs(product.producer, product) for product in deconstruct_op.inputs]
+
+        input_structure = {}
+        output_structure = {}
+        for name, op in self.get_all_ops().items():
+            # If there is an unpack op that takes in a model input, then "flatten" that op to find all downstream
+            # consumers
+            if op.type in ['TupleUnpack', 'ListUnpack']:
+                if len(op.inputs) == 1 and not op.inputs[0].producer:
+                    input_structure[op.inputs[0].name] = flatten_unpack_consumers(op)
+            # If there is a pack op that produces a model outputs, then "flatten" that op to find all the upstream
+            # nodes that produced the components
+            if op.type in ['TupleConstruct', 'ListConstruct']:
+                if len(op.output_products) == 1 and not op.output_products[0].consumers:
+                    output_structure[name] = flatten_pack_producers(op)
+
+        for name, product in self.get_all_products().items():
+            # If there is a model input that has not already been captured, then store its consumer ops
+            if product.is_model_input and name not in input_structure:
+                input_structure[name] = list(filter(
+                    lambda consumer: consumer and consumer.type not in ['TupleConstruct', 'ListConstruct'],
+                    product.consumers))
+                input_structure[name] = [get_index_in_op_inputs(consumer, product) for consumer in input_structure[name]] if len(input_structure[name]) > 0 else [None]
+            # If there is a model outputs that has not already been captured, then store its producer ops
+            elif not product.consumers and product.producer.name not in output_structure:
+                output_structure[product.producer.name] = get_index_in_op_outputs(product.producer, product )
+
+        # graph should only have one model output (could be a tuple or single item). If a single model output cannot
+        # be isolated then we do not know which one is correct.
+        if len(output_structure) == 1:
+            self._output_structure = next(iter(output_structure.values()))
+        else:
+            logger.warning("Unable to isolate model outputs.")
+            self._output_structure = None
+
+        # Remove inputs called "input_i" and populate their contents into a list based on their index
+        self._input_structure = [input_structure.pop(f'input_{i}') for i in range(len(input_structure))]
+        self._input_structure = self._input_structure[0] if len(self._input_structure) == 1 else self._input_structure
+        if len(input_structure) != 0:
+            logger.warning("Unable to isolate model inputs.")
+            self._input_structure = None
+
+    @property
+    def input_structure(self):
+        """
+        Getter function for input structure
+        """
+        return self._input_structure
+
+    @property
+    def output_structure(self):
+        """
+        Getter function for output structure
+        """
+        return self._output_structure
+
     def _optimize_connected_graph(self):
         """
         Optimization passes through the constructed graph to remove unnecessary nodes
@@ -728,6 +826,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                             constant_product = self._add_product(f'constant_{self._constant_count}',
                                                                  op.output_products[0].shape)
                             constant_product._is_const = True
+                            constant_product._is_parm = op.output_products[0].is_parm
                             self._constant_count += 1
                             constant_product.add_consumer(consumer)
                             consumer.inputs[product_index] = constant_product
@@ -924,6 +1023,7 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                 new_product.producer = product.producer
                 new_product.is_model_input = product.is_model_input
                 new_product.is_const = product.is_const
+                new_product.is_parm = product.is_parm
                 new_product._consumers = [consumer]
                 new_product_dict[new_product.name] = new_product
                 if producer and not producer.output:
@@ -1238,10 +1338,15 @@ class ConnectedGraph(AimetCommonConnectedGraph):
         :param trace: torch.jit trace of the module
         :return: Boolean whether recursive parsing needed or not. If needed returns True, False otherwise.
         """
+        # pylint: disable=import-outside-toplevel, cyclic-import
+        from aimet_torch.v2.nn import BaseQuantizationMixin
+        if isinstance(module, BaseQuantizationMixin):
+            return self._is_recursive_parsing_needed(module.get_original_module(), trace)
+
         recursive_parsing_needed = True
         if is_torch_nn_leaf_module(module) or \
                 is_custom_leaf_module(module, self._find_aten_nodes_in_forward_pass(trace)) or \
-                isinstance(module, tuple(aimet_torch.utils.modules_to_treat_as_leaf)):
+                isinstance(module, (self._aimet_defined_modules, tuple(aimet_torch.utils.modules_to_treat_as_leaf))):
             recursive_parsing_needed = False
 
         return recursive_parsing_needed

@@ -40,7 +40,7 @@ import importlib
 import inspect
 import itertools
 import json
-from typing import List, Tuple, Union, Dict, Callable, Any, Iterable, Optional, TextIO
+from typing import List, Tuple, Union, Dict, Callable, Any, Iterable, Optional, TextIO, Literal
 import contextlib
 import os
 import pickle
@@ -54,14 +54,22 @@ from safetensors.numpy import load as load_safetensor
 import torch.nn
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.nn.modules.module import (
+    _global_backward_hooks,
+    _global_forward_pre_hooks,
+    _global_forward_hooks,
+)
+try:
+    from torch.nn.modules.module import _global_backward_pre_hooks
+except ImportError:
+    _global_backward_pre_hooks = None
+
 from torchvision import datasets, transforms
 
-from aimet_common.defs import QuantScheme, QuantizationDataType, MAP_QUANT_SCHEME_TO_PYMO
-from aimet_common.utils import AimetLogger, Handle, log_with_error_and_assert_if_false
-from aimet_common.utils import profile as _profile
-import aimet_common.libpymo as libpymo
-import aimet_torch.nn.modules.custom as aimet_modules
-from aimet_torch.tensor_quantizer import TensorQuantizer, StaticGridPerChannelQuantizer, StaticGridPerTensorQuantizer
+from aimet_common.defs import QuantScheme
+from aimet_common.utils import AimetLogger, Handle
+from aimet_common.utils import profile as _profile, deprecated, _red # pylint:disable = unused-import
+from aimet_torch._base.nn.modules.custom import CustomSparseConv3DLayer, Cast
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
 
@@ -524,8 +532,13 @@ def is_leaf_module(module):
     module_list = list(module.modules())
 
     # pylint: disable=unidiomatic-typecheck
-    return bool(len(module_list) == 1) or type(module) in modules_to_treat_as_leaf or \
-        isinstance(module, aimet_modules.CustomSparseConv3DLayer)
+    ret = bool(len(module_list) == 1) or type(module) in modules_to_treat_as_leaf
+
+    if ret:
+        return ret
+
+    return CustomSparseConv3DLayer is not None and\
+           isinstance(module, CustomSparseConv3DLayer)
 
 
 def get_input_shape_batch_size(data_loader):
@@ -543,14 +556,15 @@ def get_input_shape_batch_size(data_loader):
 
 def has_hooks(module: torch.nn.Module):
     """ Returns True if the module uses hooks. """
-
-    for hooks in (module._forward_pre_hooks,                       # pylint: disable=protected-access
-                  module._forward_hooks, module._backward_hooks):  # pylint: disable=protected-access
-        if hooks:
-            logger.warning("The specified model has registered hooks which might break winnowing")
-            return True
-    return False
-
+    # pylint: disable=protected-access
+    return module._backward_hooks or\
+           module._backward_pre_hooks or\
+           module._forward_hooks or\
+           module._forward_pre_hooks or\
+           _global_backward_pre_hooks or\
+           _global_backward_hooks or\
+           _global_forward_hooks or\
+           _global_forward_pre_hooks
 
 def get_one_positions_in_binary_mask(mask):
     """
@@ -656,8 +670,10 @@ def replace_modules_with_instances_of_new_type(model: torch.nn.Module, modules_t
 def create_rand_tensors_given_shapes(input_shape: Union[Tuple, List[Tuple]], device: torch.device) \
         -> List[torch.Tensor]:
     """
-    Given shapes of some tensors, create one or more random tensors and return them as a list of tensors
-    :param input_shape: Shapes of tensors to create
+    Given shapes of some tensors, create one or more random tensors and return them as a list of tensors. Note that
+    tensor shapes must expressed as Tuples. A collection of tensor shapes may be represented as List or nested List of
+    tuples.
+    :param input_shape: Shapes of tensors to create (expressed as a Tuple, a List of Tuples, or a nested List of Tuples)
     :param device: Device to create tensors on
     :return: Created list of tensors
     """
@@ -668,7 +684,10 @@ def create_rand_tensors_given_shapes(input_shape: Union[Tuple, List[Tuple]], dev
 
     rand_tensors = []
     for shape in input_shapes:
-        rand_tensors.append(torch.rand(shape).to(device))
+        if isinstance(shape, List):
+            rand_tensors.append(create_rand_tensors_given_shapes(shape, device))
+        else:
+            rand_tensors.append(torch.rand(shape).to(device))
 
     return rand_tensors
 
@@ -778,55 +797,8 @@ def get_inout_tensor_shape_per_module(model: torch.nn.Module, input_tensor) -> D
 
         inout_tensor_shape_map[module] = (input_tensor_shape_list, output_tensor_shape_list)
 
-    run_hook_for_layers_with_given_input(model, input_tensor, record_tensor_shape)
+    run_hook_for_layers_with_given_input(model, input_tensor, record_tensor_shape, leaf_node_only=False)
     return inout_tensor_shape_map
-
-
-def create_encoding_from_dict(encoding_dict: dict) -> (libpymo.TfEncoding):
-    """
-    Create encoding object from encoding dictionary
-    :param encoding_dict: Dictionary containing encodings
-    :return: Encoding object, is_symmetric
-    """
-    encoding = libpymo.TfEncoding()
-    encoding.bw = encoding_dict.get('bitwidth')
-    encoding.max = encoding_dict.get('max')
-    encoding.min = encoding_dict.get('min')
-    encoding.delta = encoding_dict.get('scale')
-    encoding.offset = encoding_dict.get('offset')
-    log_with_error_and_assert_if_false(encoding_dict.get('is_symmetric') in ['True', 'False'],
-                                       logger,
-                                       f'Unexpected value for is_symmetric: {encoding_dict.get("is_symmetric")}')
-    return encoding
-
-
-def compute_encoding_for_given_bitwidth(data: np.ndarray, bitwidth: int, quant_scheme: QuantScheme,
-                                        is_symmetric: bool, data_type: QuantizationDataType) -> Dict:
-    """
-    Return encoding dictionary for given bitwidth
-    :param data: Numpy data
-    :param bitwidth: bitwidth (4-31) to use for quantizing data
-    :param quant_scheme: Quantization scheme
-    :param is_symmetric: True if symmetric encodings is used, False otherwise
-    :return: Encoding Dictionary
-    """
-    # Create Encodings Analyzer and collect statistical data to compute encodings
-    # Since the data is numpy array and on CPU memory, useCuda is False
-    encoding_analyzer = libpymo.EncodingAnalyzerForPython(MAP_QUANT_SCHEME_TO_PYMO[quant_scheme])
-    encoding_analyzer.updateStats(data, False)
-
-    encoding, is_encoding_valid = encoding_analyzer.computeEncoding(bitwidth, is_symmetric, False, False)
-
-    if is_encoding_valid:
-        return {'min': encoding.min,
-                'max': encoding.max,
-                'scale': encoding.delta,
-                'offset': encoding.offset,
-                'bitwidth': encoding.bw,
-                'is_symmetric': str(is_symmetric),
-                'dtype': 'int' if data_type == QuantizationDataType.int else 'float'}
-
-    return {}
 
 
 def get_reused_modules(model: torch.nn.Module, model_input: Union[torch.Tensor, Tuple]) -> \
@@ -953,35 +925,32 @@ def get_all_quantizers(model: torch.nn.Module):
     :param model: Root module
     :returns: List of parameter, input, and output quantizers
     """
-    from aimet_torch.v2.nn.base import BaseQuantizationMixin# pylint: disable=import-outside-toplevel
-    from aimet_torch.qc_quantize_op import QcQuantizeWrapper# pylint: disable=import-outside-toplevel
-    from aimet_torch.qc_quantize_recurrent import QcQuantizeRecurrent# pylint: disable=import-outside-toplevel
-
-    for m in model.modules():
-        if isinstance(m, BaseQuantizationMixin):
-            raise NotImplementedError(f'{get_all_quantizers.__qualname__} is not supported in AIMET 2')
-
     param_quantizers = []
     input_quantizers = []
     output_quantizers = []
 
-    quant_wrappers = [
-        m for m in model.modules() if isinstance(m, (QcQuantizeWrapper, QcQuantizeRecurrent))
-    ]
-    for quant_wrapper in quant_wrappers:
-        if isinstance(quant_wrapper, QcQuantizeWrapper):
-            param_quantizers.extend(quant_wrapper.param_quantizers.values())
-            input_quantizers.extend(quant_wrapper.input_quantizers)
-            output_quantizers.extend(quant_wrapper.output_quantizers)
-        else:
-            param_quantizers.extend(quant_wrapper.param_quantizers.values())
-            input_quantizers.extend(quant_wrapper.input_quantizers.values())
-            output_quantizers.extend(quant_wrapper.output_quantizers.values())
+    for module in model.modules():
+        _param_qtzrs = getattr(module, 'param_quantizers', {}).values()
+        _input_qtzrs = getattr(module, 'input_quantizers', [])
+        _output_qtzrs = getattr(module, 'output_quantizers', [])
+
+        if _param_qtzrs:
+            param_quantizers.extend(_param_qtzrs)
+
+        if _input_qtzrs:
+            input_quantizers.extend(_input_qtzrs.values()
+                                    if isinstance(_input_qtzrs, dict)
+                                    else _input_qtzrs)
+
+        if _output_qtzrs:
+            output_quantizers.extend(_output_qtzrs.values()
+                                     if isinstance(_output_qtzrs, dict)
+                                     else _output_qtzrs)
 
     return param_quantizers, input_quantizers, output_quantizers
 
 
-def disable_all_quantizers(model: torch.nn.Module) -> Handle:
+def disable_all_quantizers(model: torch.nn.Module):
     """
     Temporarily disable all quantizers in the model within with-as block, or permanently disable
     without employing context manager.
@@ -989,11 +958,12 @@ def disable_all_quantizers(model: torch.nn.Module) -> Handle:
     :param model: Root module
     :returns: Handle that enable all quantizers in the model upon handle.remove().
     """
-    from aimet_torch.v2.nn.base import BaseQuantizationMixin# pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel, cyclic-import
+    from aimet_torch.v2.nn.base import BaseQuantizationMixin
+    import aimet_torch.v2.utils as v2_utils
 
-    for m in model.modules():
-        if isinstance(m, BaseQuantizationMixin):
-            raise NotImplementedError(f'{disable_all_quantizers.__qualname__} is not supported in AIMET 2')
+    if any(isinstance(m, BaseQuantizationMixin) for m in model.modules()):
+        return v2_utils.remove_all_quantizers(model)
 
     param_quantizers, input_quantizers, output_quantizers = get_all_quantizers(model)
     all_quantizers = param_quantizers + input_quantizers + output_quantizers
@@ -1118,7 +1088,7 @@ def get_inout_tensors_dtypes_for_cast_modules(model: torch.nn.Module, input_tens
     def record_dtypes(module, inputs, outputs):
 
         # pylint: disable=protected-access
-        if isinstance(module, aimet_modules.Cast):
+        if isinstance(module, Cast):
             input_dtype = None
 
             if isinstance(inputs, (list, tuple)):
@@ -1134,38 +1104,6 @@ def get_inout_tensors_dtypes_for_cast_modules(model: torch.nn.Module, input_tens
 
     run_hook_for_layers_with_given_input(model, input_tensor, record_dtypes)
     return inout_dtypes_map
-
-
-def create_encoding_dict(encoding: libpymo.TfEncoding, quantizer, propagate_encodings: bool) -> Union[Dict, None]:
-    """
-    Create encoding dictionary from encoding object
-    :param encoding: Encoding of the quantizer
-    :param quantizer: Tensor Quantizer
-    :param propagate_encodings: If True, encoding entries for intermediate ops (when one PyTorch ops results in
-            multiple ONNX nodes) are filled with the same BW and data_type as the output tensor for that series of
-            ops.
-    :return: Encoding Dictionary
-    """
-    data_type, bitwidth = quantizer.data_type, quantizer.bitwidth
-
-    if data_type == QuantizationDataType.float:
-        enc_dict = {'bitwidth': bitwidth, 'dtype': "float"}
-    else:
-        if encoding:
-            if propagate_encodings:
-                # Shortened encodings will be filled into a layer that only exists due to expansion of PyTorch ops
-                # into multiple ONNX ops so that it's necessarily to use the same bitwidth and type
-                enc_dict = {'bitwidth': encoding.bw, 'dtype': "int"}
-            else:
-                encoding_min, encoding_max, bw, scale, offset = encoding.min, encoding.max, encoding.bw, \
-                                                                encoding.delta, encoding.offset
-                is_symmetric = quantizer.use_symmetric_encodings
-
-                enc_dict = {'min': encoding_min, 'max': encoding_max, 'scale': scale, 'offset': int(offset),
-                            'bitwidth': bw, 'is_symmetric': str(is_symmetric), 'dtype': "int"}
-        else:
-            enc_dict = None
-    return enc_dict
 
 
 def get_propagated_encoding_dict(encoding_dict: List[Dict[str, any]]) -> List[Dict[str, any]]:
@@ -1195,128 +1133,34 @@ def get_v1_quant_scheme_for_initialization(quant_scheme: QuantScheme) -> QuantSc
     return quant_scheme
 
 
-def _validate_is_symmetric_flag(quantizer: TensorQuantizer, encoding_dict: Dict, strict: bool):
-    """
-    sub utility of 'validate_is_symmetric_flag'
-    """
-    if 'is_symmetric' in encoding_dict:
-        is_symmetric = encoding_dict['is_symmetric'] == 'True'
-        if quantizer.use_symmetric_encodings != is_symmetric:
-            # If not strict, raise a warning and override the quantizer
-            # setting with provided 'is_symmetric' flag from encoding_dict
-            if not strict:
-                logger.warning("Using Provided 'is_symmetric' flag in encodings (set to %s) "
-                               "which doesn't match with quantizer setting (set to %s), to "
-                               "compute partial encodings", is_symmetric, quantizer.use_symmetric_encodings)
-            else:
-                raise AssertionError("Provided 'is_symmetric' flag in encodings (set to %s) doesn't match with "
-                                     "quantizer setting (set to %s)" % (is_symmetric, quantizer.use_symmetric_encodings))
-    else:
-        raise AttributeError("Provided encoding doesn't have 'is_symmetric' flag")
+def _deleted_module_import_error(name: str, since: str, v1_legacy_api: str = None) -> ImportError:
+    msg = f"{name} module is deleted since aimet_torch=={since}."
+
+    if v1_legacy_api:
+        msg += f" If you must keep using the v1 legacy API for backwards-compatibility,"\
+               f" please import \"{v1_legacy_api}\" instead."
+
+    return ImportError(msg)
 
 
-def get_per_channel_quantizer_from_per_tensor(quantizer: TensorQuantizer, original_module: torch.nn.Module):
-    """ Get PerChannel Quantizer with same settings as given PerTensor Quantizer """
-    channel_axis = 0
-    if isinstance(original_module, (torch.nn.ConvTranspose1d,
-                          torch.nn.ConvTranspose2d,
-                          torch.nn.ConvTranspose3d)):
-        if len(original_module.weight.shape) > 1:
-            channel_axis = 1
+def _warn_deprecated_in_v2(name: str, v1_legacy_api: str = None):
+    msg = f"\"{name}\" will be deprecated soon in the later versions."
 
-    num_channels = original_module.weight.shape[channel_axis]
-    use_strict_symmetric = quantizer.use_strict_symmetric
-    use_unsigned_symmetric = quantizer.use_unsigned_symmetric
-    quantizer = StaticGridPerChannelQuantizer(quantizer.bitwidth, quantizer.round_mode,
-                                              quantizer.quant_scheme,
-                                              quantizer.use_symmetric_encodings,
-                                              num_channels=num_channels,
-                                              enabled_by_default=quantizer.enabled,
-                                              ch_axis=channel_axis,
-                                              data_type=quantizer.data_type)
-    quantizer.use_strict_symmetric = use_strict_symmetric
-    quantizer.use_unsigned_symmetric = use_unsigned_symmetric
-    return quantizer
+    if v1_legacy_api:
+        msg += f" If you must keep using the v1 legacy API for backwards-compatibility,"\
+               f" please import \"{v1_legacy_api}\" instead."
+
+    warnings.warn(_red(msg), DeprecationWarning, stacklevel=3)
 
 
-def get_per_tensor_quantizer_from_per_channel(quantizer: TensorQuantizer):
-    """ Get PerTensor Quantizer with same settings as given PerChannel Quantizer """
-    use_strict_symmetric = quantizer.use_strict_symmetric
-    use_unsigned_symmetric = quantizer.use_unsigned_symmetric
-    quantizer = StaticGridPerTensorQuantizer(quantizer.bitwidth, quantizer.round_mode,
-                                             quantizer.quant_scheme,
-                                             quantizer.use_symmetric_encodings,
-                                             enabled_by_default=quantizer.enabled,
-                                             data_type=quantizer.data_type)
-    quantizer.use_strict_symmetric = use_strict_symmetric
-    quantizer.use_unsigned_symmetric = use_unsigned_symmetric
-    return quantizer
+def _warn_replaced_in_v2(name: str, v2_new_api: str, v1_legacy_api: str = None):
+    msg = f"\"{name}\" will be replaced with \"{v2_new_api}\" soon in the later versions."
 
+    if v1_legacy_api:
+        msg += f" If you must keep using the v1 legacy API for backwards-compatibility,"\
+               f" please import \"{v1_legacy_api}\" instead."
 
-def validate_is_symmetric_flag(quantizer: TensorQuantizer, encoding_dict: Dict, strict: bool = True):
-    """
-    Validate 'is_symmetric' flag from encoding_dict with quantizer.use_symmetric_encodings and set the later accordingly
-    :param quantizer: Quantizer for which use_symmetric_encodings needs to be validated and set
-    :param encoding_dict: encoding_dict from external overrides
-    :param strict: flag to decide whether to raise an error or soft warning
-    :return:
-    """
-    if not (encoding_dict.get('max', 0) == 0 and encoding_dict.get('min', 0) == 0) and encoding_dict.get('delta', 0) != 0:
-        # In case of full encoding, error out when quantizer setting doesn't match with provided 'is_symmetric' flag
-        _validate_is_symmetric_flag(quantizer, encoding_dict, strict=True)
-
-    # In case of partial encodings, use is_symmetric from encodings provided to compute full encoding
-    _validate_is_symmetric_flag(quantizer, encoding_dict, strict=strict)
-
-
-def compute_partial_encoding(quantizer: TensorQuantizer, encoding_dict: Dict) -> Dict:
-    """
-    Generates the full encoding from partially provided encoding.
-
-    :param quantizer:  Quantizer object for which the encoding needs to be computed.
-    :param encoding_dict: Partial Encoding
-    :return: Full encoding
-    """
-
-    encoding = libpymo.TfEncoding()
-    encoding.bw = encoding_dict.get('bitwidth')
-    encoding.max = encoding_dict.get('max', 0)
-    encoding.min = encoding_dict.get('min', 0)
-    encoding.delta = encoding_dict.get('scale', 0)
-    encoding.offset = encoding_dict.get('offset', 0)
-
-    if not (encoding.max == 0 and encoding.min == 0) and encoding.delta != 0:
-        return encoding_dict
-
-    partial_quantizer = libpymo.TensorQuantizer(libpymo.QuantizationMode.QUANTIZATION_TF, quantizer.round_mode)
-    partial_quantizer.computePartialEncoding(encoding.bw, encoding, quantizer.use_symmetric_encodings,
-                                             quantizer.use_unsigned_symmetric, quantizer.use_strict_symmetric)
-
-    encoding_dict['max'] = encoding.max
-    encoding_dict['min'] = encoding.min
-    encoding_dict['scale'] = encoding.delta
-    encoding_dict['offset'] = encoding.offset
-    encoding_dict['is_symmetric'] = 'True' if quantizer.use_symmetric_encodings else 'False'
-
-    return encoding_dict
-
-
-def _red(msg: str):
-    return f'\x1b[31;21m{msg}\x1b[0m'
-
-
-def deprecated(msg: str):
-    """
-    Wrap a function or class such that a deprecation warning is printed out when invoked
-    """
-    def decorator(_callable):
-        @functools.wraps(_callable)
-        def fn_wrapper(*args, **kwargs):
-            warnings.warn(_red(f'{_callable.__qualname__} will be deprecated soon in the later versions. {msg}'),
-                          DeprecationWarning, stacklevel=2)
-            return _callable(*args, **kwargs)
-        return fn_wrapper
-    return decorator
+    warnings.warn(_red(msg), DeprecationWarning, stacklevel=3)
 
 
 def profile(label: str, file: Union[str, os.PathLike, TextIO] = None, new_file: bool = False, logger: Optional[logging.Logger] = None): # pylint: disable=redefined-outer-name
@@ -1460,3 +1304,36 @@ def _get_metadata_and_state_dict(safetensor_file_path: str) -> [dict, dict]:
     state_dict = {k: torch.from_numpy(v) for k, v in state_dict.items()}
 
     return state_dict, meta_data
+
+
+def _get_default_api() -> Union[Literal["v1"], Literal["v2"]]:
+    default_api = os.getenv("AIMET_DEFAULT_API", "v2").lower()
+
+    if default_api not in ("v1", "v2"):
+        raise RuntimeError("Invalid value specified for environment variable AIMET_DEFAULT_API. "
+                           f"Expected either 'v1' or 'v2', but got '{default_api}'")
+
+    return default_api
+
+
+__migrated__ = {
+    'compute_encoding_for_given_bitwidth',
+    'compute_partial_encoding',
+    'create_encoding_dict',
+    'create_encoding_from_dict',
+    'get_per_channel_quantizer_from_per_tensor',
+    'get_per_tensor_quantizer_from_per_channel',
+    '_validate_is_symmetric_flag',
+    'validate_is_symmetric_flag',
+}
+
+
+def __getattr__(name: str):
+    try:
+        return globals()[name]
+    except KeyError as e:
+        if _get_default_api() == "v2" and name in __migrated__:
+            msg = f'"{name}" has been moved to aimet_torch.v1.utils since aimet-torch==2.0.0'
+        else:
+            msg = f"module '{__name__}' has no attribute '{name}'"
+        raise AttributeError(msg) from e

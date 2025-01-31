@@ -99,6 +99,24 @@ DTYPE GetMin(const DTYPE* data, int cnt, ComputationMode cpuGpuMode)
     }
 }
 
+template <typename DTYPE>
+std::tuple<DTYPE, DTYPE> GetMinMax(const DTYPE* data, int cnt, ComputationMode cpuGpuMode)
+{
+    switch (cpuGpuMode)
+    {
+    case COMP_MODE_CPU:
+        return std::make_tuple(GetMin_cpu(data, cnt), GetMax_cpu(data, cnt));
+    case COMP_MODE_GPU:
+#ifdef GPU_QUANTIZATION_ENABLED
+        return GetMinMax_gpu(data, cnt);
+#else
+            throw runtime_error("Not compiled for GPU mode.");
+#endif
+    default:
+        throw runtime_error("Unknown computation mode.");
+    }
+}
+
 double logBase2(double d)
 {
     return log(d) / log(2);
@@ -231,7 +249,7 @@ void InitializePdf(PDF& pdf, DTYPE min_val, DTYPE max_val, bool signed_vals)
     for (int i = 0; i < PDF_SIZE; ++i)
     {
         if (signed_vals)
-            pdf.xLeft[i] = min_val + i * bucket_size;
+            pdf.xLeft[i] = floor(min_val / bucket_size + i) * bucket_size;
         else
             pdf.xLeft[i] = i * bucket_size;
     }
@@ -373,7 +391,7 @@ void GetHistogram_cpu(const DTYPE* data, int cnt, uint32_t histogram[PDF_SIZE], 
     {
         // Map a floating point number to the appropriate bucket.
         int index =
-            is_signed ? round(data[i] / bucket_size - pdf_offset) : round(std::abs(data[i]) / bucket_size - pdf_offset);
+            is_signed ? floor(data[i] / bucket_size - pdf_offset) : floor(std::abs(data[i]) / bucket_size - pdf_offset);
 
         // Add to histogram, if inside the histogram range.
         if (index >= 0 && index < PDF_SIZE)
@@ -650,6 +668,10 @@ template float GetMax(const float* data, int cnt, ComputationMode mode_cpu_gpu);
 template double GetMin(const double* data, int cnt, ComputationMode mode_cpu_gpu);
 
 template float GetMin(const float* data, int cnt, ComputationMode mode_cpu_gpu);
+
+template std::tuple<float, float> GetMinMax(const float* data, int cnt, ComputationMode cpuGpuMode);
+
+template std::tuple<double, double> GetMinMax(const double* data, int cnt, ComputationMode cpuGpuMode);
 
 template void UpdatePdf(const double* data, int cnt, ComputationMode mode_cpu_gpu, bool signed_vals, PDF& pdf,
                         IAllocator* allocator);

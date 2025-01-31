@@ -55,5 +55,24 @@ add_custom_target(whl_prep_ln_common DEPENDS
     whl_prep_ln_common_PyModelOptimizations
 )
 
+add_custom_target(generate_deps
+    COMMAND python3
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/python/aimet_common/_gen.py"
+            --output-dir ${CMAKE_BINARY_DIR}/artifacts/aimet_common
+)
+if(SKBUILD)
+install(DIRECTORY ${CMAKE_BINARY_DIR}/artifacts/aimet_common/
+        DESTINATION aimet_common
+        FILES_MATCHING
+        PATTERN "_deps.py"
+      )
+else()
+install(DIRECTORY ${CMAKE_BINARY_DIR}/artifacts/aimet_common/
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/python/aimet_common
+        FILES_MATCHING
+        PATTERN "_deps.py"
+      )
+endif()
+
 add_dependencies(whl_prep_ln whl_prep_ln_common)
 whl_add_whl_action_target(common)

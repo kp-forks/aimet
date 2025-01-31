@@ -49,14 +49,13 @@ import torch.nn as nn
 import torch.onnx.symbolic_caffe2
 import torchvision
 import onnx
-import onnxsim
 import yaml
 from onnx import GraphProto
 from packaging import version  # pylint: disable=wrong-import-order
 
 from aimet_common.utils import AimetLogger
 import aimet_torch.utils
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 from aimet_torch.defs import OpToIOTensors
 
 _logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Utils)
@@ -71,9 +70,6 @@ EXPORT_TO_ONNX_DIRECT = False
 # runs the second pass of markers for non-leaf torch module and updates names of onnx ops belonging to
 # non-leaf pytorch module
 update_all_onnx_nodes_name = True
-
-# executes onnx simplify on the onnx model with marker attached.
-simplify_onnx_model = False
 
 # Flag to adjust ONNX node output to have unique name
 MAKE_NODE_OUTPUT_NAME_UNIQUE = True
@@ -543,7 +539,7 @@ class OnnxSaver:
             map_output_tensor_to_node[output] = node
 
         for attribute in node.attribute:
-            if getattr(attribute, 'g', None) is not None:
+            if getattr(attribute, 'g').name != '':
                 for subnode in getattr(attribute, 'g').node:
                     OnnxSaver._populate_input_output_tensor_maps(map_input_tensor_to_node, map_output_tensor_to_node,
                                                                  subnode)
@@ -800,7 +796,7 @@ class OnnxSaver:
 
                 visited.add(id(node))
                 for attribute in node.attribute:
-                    if getattr(attribute, 'g', None) is not None:
+                    if getattr(attribute, 'g').name != '':
                         # traversing the list in reverse, see 'NOTE1'
                         for subnode in reversed(getattr(attribute, 'g').node):
                             pending_nodes_list.appendleft((subnode, parent_module_name))
@@ -884,7 +880,7 @@ class OnnxSaver:
 
         for node in onnx_graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._populate_graph_and_output_names_lists(attribute.g, graphs_list, output_names_list)
 
     @staticmethod
@@ -903,7 +899,7 @@ class OnnxSaver:
 
         for node in onnx_graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._get_onnx_node_map(attribute.g, onnx_node_map)
         return onnx_node_map
 
@@ -1041,10 +1037,18 @@ class OnnxSaver:
         """
         if node_output_name_counter is None:
             node_output_name_counter = {}
-
         if param_name_to_updated_name is None:
             param_name_to_updated_name = {}
 
+        # Remove 'marked_module' string from input and output field of onnx.GraphProto
+        for inp in onnx_graph.input:
+            updated_name = cls._get_updated_name(inp.name)
+            inp.name = updated_name
+        for out in onnx_graph.output:
+            updated_name = cls._get_updated_name(out.name)
+            out.name = updated_name
+
+        # Remove 'marked_module' string from all node's input and output names.
         for node in onnx_graph.node:
             for index, param_name in enumerate(node.output):
                 updated_name = cls._get_updated_name(param_name)
@@ -1064,9 +1068,10 @@ class OnnxSaver:
                     updated_name = param_name_to_updated_name.get(param_name, updated_name)
                 node.input[index] = updated_name
 
+        # Recursively updates subgraph node's input and output names.
         for node in onnx_graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     cls._remove_marked_module_string_from_node_inp_out_names(
                         attribute.g, node_output_name_counter, param_name_to_updated_name
                     )
@@ -1127,7 +1132,7 @@ class OnnxSaver:
 
         for node in onnx_graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._remove_detached_nodes_from_onnx_graph(attribute.g)
 
     @classmethod
@@ -1213,7 +1218,7 @@ class OnnxSaver:
                 end_marker_map[identifier].append(node)
 
         for attribute in node.attribute:
-            if getattr(attribute, 'g', None) is not None:
+            if getattr(attribute, 'g').name != '':
                 for subnode in getattr(attribute, 'g').node:
                     OnnxSaver._populate_start_and_end_marker_maps(start_marker_map, end_marker_map, subnode)
 
@@ -1254,11 +1259,6 @@ class OnnxSaver:
         """
         onnx_model = onnx.load(filepath)
         onnx_model = restore_onnx_graph_initializers(onnx_model, inplace=True)
-
-        if simplify_onnx_model:
-            onnx_model_simplified, check = onnxsim.simplify(onnx_model)
-            if check:
-                return onnx_model_simplified
         return onnx_model
 
     @classmethod
@@ -1381,7 +1381,7 @@ class OnnxSaver:
 
         for node in onnx_model.graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._set_output_names_for_graph(attribute.g, graphs_list, output_names_for_all_graphs,
                                                           map_output_tensor_to_node, map_input_tensor_to_node)
 
@@ -1452,7 +1452,7 @@ class OnnxSaver:
         for node in onnx_graph.node:
             all_nodes.append(node)
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._get_all_nodes(attribute.g, all_nodes)
         return all_nodes
 
@@ -1519,7 +1519,7 @@ class OnnxSaver:
             initializers.append(initializer)
         for node in onnx_graph.node:
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._get_all_initializers(attribute.g, initializers)
         return initializers
 
@@ -1547,7 +1547,7 @@ class OnnxSaver:
                     valid_param_set.add(input_tensor)
 
             for attribute in node.attribute:
-                if getattr(attribute, 'g', None) is not None:
+                if getattr(attribute, 'g').name != '':
                     OnnxSaver._populate_node_to_io_tensor_map_and_valid_param_set(attribute.g, initializer_names,
                                                                                   node_to_io_tensor_name_map,
                                                                                   valid_param_set)
@@ -1776,3 +1776,19 @@ def get_layers_in_io_tensor_map(op_to_io_tensor_map: Dict) -> Dict[str, str]:
             else:
                 layers_to_onnx_op_names[pytorch_name] = [name]
     return layers_to_onnx_op_names
+
+
+__deleted_atttributes__ = {
+    'simplify_onnx_model': 'aimet_torch==2.0'
+}
+
+def __getattr__(name: str):
+    try:
+        return globals()[name]
+    except KeyError as e:
+        if name in __deleted_atttributes__:
+            since = __deleted_atttributes__[name]
+            msg = f"Attribute '{name}' was deleted from aimet_torch.onnx_utils since {since}"
+        else:
+            msg = f"module '{__name__}' has no attribute '{name}'"
+        raise AttributeError(msg) from e

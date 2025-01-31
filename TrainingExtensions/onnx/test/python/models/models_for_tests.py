@@ -52,6 +52,7 @@ from torch.nn.modules.instancenorm import _InstanceNorm
 from torch.nn.modules.batchnorm import _BatchNorm
 from onnx import helper, numpy_helper, OperatorSetIdProto, TensorProto, load_model
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
+from onnxruntime_extensions import PyOp, onnx_op
 
 from aimet_common import libquant_info
 from .mobilenet import MockMobileNetV1, MockMobileNetV11
@@ -1634,31 +1635,35 @@ class MultipleOutputModel(SingleResidual):
         return x, y
 
 
-def _convert_to_onnx_no_fold(model: torch.nn.Module, dummy_input, filename='./temp_model.onnx'):
-    torch.onnx.export(model.eval(),
-                      dummy_input,
-                      filename,
-                      training=torch.onnx.TrainingMode.PRESERVE,
-                      export_params=True,
-                      opset_version=12,
-                      do_constant_folding=False,
-                      input_names=['input'],
-                      output_names=['output'])
-    model = ONNXModel(load_model(filename))
+def _convert_to_onnx_no_fold(model: torch.nn.Module, dummy_input, filename='temp_model.onnx'):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        save_path = os.path.join(tmp_dir, filename)
+        torch.onnx.export(model.eval(),
+                          dummy_input,
+                          save_path,
+                          training=torch.onnx.TrainingMode.PRESERVE,
+                          export_params=True,
+                          opset_version=12,
+                          do_constant_folding=False,
+                          input_names=['input'],
+                          output_names=['output'])
+        model = ONNXModel(load_model(save_path))
     return model
 
 
-def _convert_to_onnx(model: torch.nn.Module, dummy_input, filename='./temp_model.onnx'):
-    torch.onnx.export(model.eval(),
-                      dummy_input,
-                      filename,
-                      training=torch.onnx.TrainingMode.EVAL,
-                      export_params=True,
-                      opset_version=12,
-                      do_constant_folding=True,
-                      input_names=['input'],
-                      output_names=['output'])
-    model = ONNXModel(load_model(filename))
+def _convert_to_onnx(model: torch.nn.Module, dummy_input, filename='temp_model.onnx'):
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        save_path = os.path.join(tmp_dir, filename)
+        torch.onnx.export(model.eval(),
+                          dummy_input,
+                          save_path,
+                          training=torch.onnx.TrainingMode.EVAL,
+                          export_params=True,
+                          opset_version=12,
+                          do_constant_folding=True,
+                          input_names=['input'],
+                          output_names=['output'])
+        model = ONNXModel(load_model(save_path))
     return model
 
 
@@ -2072,6 +2077,14 @@ def pointwise_convtranspose3d(input_shape):
                       transpose=True,
                       auto_pad="SAME_UPPER")
 
+def padded_convtranspose2d(input_shape):
+    pads = [1, 0, 1, 3]
+    return conv_model(weight_shape=(input_shape[1], input_shape[1], 1, 1),
+                      input_shape=input_shape,
+                      output_shape=[input_shape[0], input_shape[1], input_shape[2] - pads[0] - pads[2], input_shape[3] - pads[1] - pads[3]],
+                      transpose=True,
+                      pads=pads)
+
 
 def dynamic_matmul_model(batch_size):
     class Model(torch.nn.Module):
@@ -2406,4 +2419,336 @@ def gather_op_with_int_data_model():
         )
     )
     onnx.checker.check_model(model, True)
+    return model
+
+
+def matmul_add_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='MatMulAddModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[1, 1, 8, 8])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[1, 1, 8, 8])],
+            initializer=[
+                numpy_helper.from_array(np.full((1, 1, 8, 8), 25.0).astype('float32'), name='matmul_1.weight'),
+                numpy_helper.from_array(np.full((1, 1, 8, 8), 100.0).astype('float32'), name='add_1.weight'),
+                numpy_helper.from_array(np.full((1, 1, 8, 8), -50.0).astype('float32'), name='add_2.weight'),
+            ],
+            nodes=[
+                helper.make_node(
+                    'MatMul',
+                    inputs=['model_input', 'matmul_1.weight'],
+                    outputs=['matmul_1.output'],
+                    name='matmul_1'
+                ),
+                helper.make_node(
+                    'Add',
+                    inputs=['matmul_1.output', 'add_1.weight'],
+                    outputs=['add_1.output'],
+                    name='add_1'
+                ),
+                helper.make_node(
+                    'MatMul',
+                    inputs=['model_input', 'add_1.output'],
+                    outputs=['matmul_2.output'],
+                    name='matmul_2'
+                ),
+                helper.make_node(
+                    'Add',
+                    inputs=['matmul_2.output', 'add_2.weight'],
+                    outputs=['model_output'],
+                    name='add_2'
+                )
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+def softmax_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='SoftmaxModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[1, 1, 8, 8])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[1, 1, 8, 8])],
+            initializer=[
+                numpy_helper.from_array(np.full((1, 1, 8, 8), 25.0).astype('float32'), name='matmul_1.weight'),
+            ],
+            nodes=[
+                helper.make_node(
+                    'MatMul',
+                    inputs=['model_input', 'matmul_1.weight'],
+                    outputs=['matmul.output'],
+                    name='matmul'
+                ),
+                helper.make_node(
+                    'Softmax',
+                    inputs=['matmul.output'],
+                    outputs=['softmax.output'],
+                    name='softmax'
+                ),
+                helper.make_node(
+                    'Sigmoid',
+                    inputs=['softmax.output'],
+                    outputs=['model_output'],
+                    name='sigmoid'
+                ),
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+
+def batchnorm_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='BatchnormModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            initializer=[
+                numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32'), name='batchnorm.weight'),
+                numpy_helper.from_array(np.random.randn(10, ).astype('float32'), name='batchnorm.bias'),
+                numpy_helper.from_array(np.random.randn(10, ).astype('float32'), name='batchnorm.input_mean'),
+                numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32'), name='batchnorm.input_var')
+            ],
+            nodes=[
+                helper.make_node(
+                    'BatchNormalization',
+                    inputs=['model_input', 'batchnorm.weight', 'batchnorm.bias', 'batchnorm.input_mean', 'batchnorm.input_var'],
+                    outputs=['model_output'],
+                    name='batchnorm'
+                ),
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+def batchnorm_model_constants():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='BatchnormModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            initializer=[],
+            nodes=[
+                helper.make_node('Constant', inputs=[], outputs=["batchnorm.weight"],
+                                 value=numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32')), name='weight'),
+                helper.make_node('Constant', inputs=[], outputs=["batchnorm.bias"],
+                                 value=numpy_helper.from_array(np.random.randn(10, ).astype('float32')), name='bias'),
+                helper.make_node('Constant', inputs=[], outputs=["batchnorm.input_mean"],
+                                 value=numpy_helper.from_array(np.random.randn(10, ).astype('float32')), name="input_mean"),
+                helper.make_node('Constant', inputs=[], outputs=["batchnorm.input_var"],
+                                 value=numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32')), name='input_var'),
+                helper.make_node(
+                    'BatchNormalization',
+                    inputs=['model_input', 'batchnorm.weight', 'batchnorm.bias', 'batchnorm.input_mean', 'batchnorm.input_var'],
+                    outputs=['model_output'],
+                    name='batchnorm'
+                ),
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+def integer_concat_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='IntConcatModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10, 1])],
+            initializer=[],
+            nodes=[
+                helper.make_node('Constant', inputs=[], outputs=["constant_one"],
+                                 value=numpy_helper.from_array(np.array([1]).astype('int64')), name='one'),
+                helper.make_node(
+                    'Shape',
+                    inputs=['model_input'],
+                    outputs=['input_shape'],
+                    name='shape'
+                ),
+                helper.make_node(
+                    'Concat',
+                    inputs=['input_shape', 'constant_one'],
+                    outputs=['output_shape'],
+                    name='out_shape',
+                    axis=0
+                ),
+                helper.make_node(
+                    "Reshape",
+                    inputs=["model_input", "output_shape"],
+                    outputs=["model_output"]
+                )
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+
+def shared_stat_batchnorm_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name='BatchnormModel',
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10, 8, 8])],
+            initializer=[
+                numpy_helper.from_array(np.random.randn(10, 10, 1, 1).astype('float32'), name='conv_1.weight'),
+                numpy_helper.from_array(np.random.randn(10, 10, 1, 1).astype('float32'), name='conv_2.weight'),
+                numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32'), name='batchnorm.weight'),
+                numpy_helper.from_array(np.random.randn(10, ).astype('float32'), name='batchnorm.bias'),
+                numpy_helper.from_array(np.random.randn(10, ).astype('float32'), name='batchnorm.input_mean'),
+                numpy_helper.from_array(np.abs(np.random.randn(10, )).astype('float32'), name='batchnorm.input_var')
+            ],
+            nodes=[
+                helper.make_node(
+                    'Conv',
+                    inputs=['model_input', 'conv_1.weight'],
+                    outputs=['conv_1.output'],
+                    name='conv_1'
+                ),
+                helper.make_node(
+                    'Identity',
+                    inputs=['batchnorm.input_mean'],
+                    outputs=['batchnorm1.input_mean'],
+                    name='identity_1'
+                ),
+                helper.make_node(
+                    'BatchNormalization',
+                    inputs=['conv_1.output', 'batchnorm.weight', 'batchnorm.bias', 'batchnorm1.input_mean', 'batchnorm.input_var'],
+                    outputs=['batch_norm_1.output'],
+                    name='batchnorm_1'
+                ),
+                helper.make_node(
+                    'Conv',
+                    inputs=['batch_norm_1.output', 'conv_2.weight'],
+                    outputs=['conv_2.output'],
+                    name='conv_2'
+                ),
+                helper.make_node(
+                    'Identity',
+                    inputs=['batchnorm.input_mean'],
+                    outputs=['batchnorm2.input_mean'],
+                    name='identity_2'
+                ),
+                helper.make_node(
+                    'BatchNormalization',
+                    inputs=['conv_2.output', 'batchnorm.weight', 'batchnorm.bias', 'batchnorm2.input_mean',
+                            'batchnorm.input_var'],
+                    outputs=['model_output'],
+                    name='batchnorm_2'
+                ),
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+def matmul_with_constant_first_input():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name="MatMulModel",
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 1])],
+            initializer=[
+                numpy_helper.from_array(np.random.randn(10, 10).astype('float32'), name='matmul.weight'),
+                numpy_helper.from_array(np.array([1]).astype('int64'), name='axes')
+            ],
+            nodes=[
+                helper.make_node(
+                    "Unsqueeze",
+                    inputs=["model_input", "axes"],
+                    outputs=["matmul_input"],
+                ),
+                helper.make_node(
+                    "MatMul",
+                    inputs=["matmul.weight", "matmul_input"],
+                    outputs=["model_output"],
+                    name="matmul"
+                )
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+def conv_with_weight_identity_input():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name="IdentityConvModel",
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10, 32, 32])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10, 32, 32])],
+            initializer=[
+                numpy_helper.from_array(np.random.randn(10, 10, 1, 1).astype('float32'), name='identity.input'),
+            ],
+            nodes=[
+                helper.make_node(
+                    "Identity",
+                    inputs=["identity.input"],
+                    outputs=["conv.weight"],
+                ),
+                helper.make_node(
+                    "Conv",
+                    inputs=["model_input", "conv.weight"],
+                    outputs=["model_output"],
+                    name="conv"
+                )
+            ]
+        )
+    )
+    onnx.checker.check_model(model, True)
+    return model
+
+
+def squeezenet1_0(tmpdir):
+    import torchvision
+    filepath = os.path.join(os.path.join(tmpdir, "squeezenet1_0.onnx"))
+    model = torchvision.models.squeezenet1_0()
+    torch.onnx.export(model.eval(), torch.randn(1, 3, 224, 224), filepath,
+                      training=torch.onnx.TrainingMode.EVAL, do_constant_folding=False,
+                      input_names=["input"], output_names=["output"])
+    model = onnx.load(filepath)
+    return ONNXModel(model)
+
+@onnx_op(op_type="CustomAdd",
+         inputs=[PyOp.dt_float, PyOp.dt_float],
+         outputs=[PyOp.dt_float])
+def add_op(x, y):
+    return x + y
+
+def custom_op_model():
+    model = helper.make_model(
+        graph=helper.make_graph(
+            name="CustomAddModel",
+            inputs=[helper.make_tensor_value_info('model_input', TensorProto.FLOAT, shape=[10, 10])],
+            outputs=[helper.make_tensor_value_info('model_output', TensorProto.FLOAT, shape=[10, 10])],
+            initializer=[],
+            nodes=[
+                helper.make_node(
+                    "Relu",
+                    inputs=["model_input"],
+                    outputs=["y"],
+                ),
+                helper.make_node(
+                    "CustomAdd",
+                    inputs=["model_input", "y"],
+                    outputs=["z"],
+                    domain="ai.onnx.contrib"
+                ),
+                helper.make_node(
+                    "CustomAdd",
+                    inputs=["z", "y"],
+                    outputs=["output"],
+                    domain="ai.onnx.contrib"
+                ),
+                helper.make_node(
+                    "Exp",
+                    inputs=["output"],
+                    outputs=["model_output"]
+                )
+            ],
+        ),
+        opset_imports=[helper.make_operatorsetid('ai.onnx.contrib', 1)]
+    )
     return model

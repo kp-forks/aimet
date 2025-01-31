@@ -36,6 +36,8 @@
 # =============================================================================
 
 """ Implementation to automatically prepare keras models for AIMET by converting them to a functional model """
+import typing
+
 import inspect
 import logging
 from typing import Any, Dict, List, Set, Union, Optional
@@ -402,6 +404,21 @@ class _KerasModelPreparer:
             return {}
         return call_kwargs
 
+    def _update_nested_values(self, values: typing.List | typing.Tuple, old_to_new_tensor_mapper: typing.Dict):
+        """
+        Helper function to update the nested Lists/Tuples based on the dictionary provided
+        :param values: List/Tuple of values
+        :param old_to_new_tensor_mapper: Update dictionary
+        :return: Any
+        """
+        if isinstance(values, typing.Tuple):
+            return tuple(self._update_nested_values(x, old_to_new_tensor_mapper) for x in values)
+        if isinstance(values, typing.List):
+            return [self._update_nested_values(x, old_to_new_tensor_mapper) for x in values]
+        if isinstance(values, KerasTensor) and values.name in old_to_new_tensor_mapper:
+            return old_to_new_tensor_mapper[values.name]
+        return values
+
     def _update_output_tensors_in_model_layers_connections(
             self,
             layer: tf.keras.layers.Layer,
@@ -415,7 +432,53 @@ class _KerasModelPreparer:
         :param new_output_tensor: The new output tensor to update with
         :param model: The model currently being checked. Used to add model outputs
         """
-        if layer.name != new_output_tensor.name:
+        # pylint: disable=too-many-nested-blocks, disable=protected-access, too-many-locals, too-many-branches
+        if isinstance(new_output_tensor, List):
+            # Handling case where layer has list of output tensors
+            old_tensors = self.model_layers_connections[ModelLayerConnectionsProperties.LAYER_OUTPUT_TENSOR_MAP][layer.name]
+            # Updating layer_output_tensor_map to new tensors
+            self.model_layers_connections[ModelLayerConnectionsProperties.LAYER_OUTPUT_TENSOR_MAP][layer.name] = [tensor.name for tensor in new_output_tensor]
+
+            old_to_new_tensor_mapper = {old_tensor_name: new_output_tensor[i] for i, old_tensor_name in
+                                        enumerate(old_tensors)}
+
+            old_name_of_inputs = None
+            if layer.name in self.model_layers_connections[ModelLayerConnectionsProperties.INBOUND_NODES]:
+                old_name_of_inputs = self.model_layers_connections[ModelLayerConnectionsProperties.INBOUND_NODES].pop(
+                    layer.name
+                )
+            for out_tensor in new_output_tensor:
+                new_name = out_tensor.name
+                if old_name_of_inputs is not None:
+                    self.model_layers_connections[ModelLayerConnectionsProperties.INBOUND_NODES].update(
+                        {new_name: old_name_of_inputs}
+                    )
+                self.model_layers_connections[ModelLayerConnectionsProperties.OUTPUT_TENSORS].update(
+                    {out_tensor.name: out_tensor}
+                )
+
+            # Update inbound_nodes with new tensor names
+            for node_name, values in self.model_layers_connections[ModelLayerConnectionsProperties.INBOUND_NODES].items():
+                if layer.name in values:
+                    # Update tensor for this entire layer
+                    tensor_list = self._flatten_list(self.model_layers_connections[ModelLayerConnectionsProperties.CALL_ARGS][node_name])
+                    tensor_list.extend(self._flatten_list(list(self.model_layers_connections[ModelLayerConnectionsProperties.CALL_KWARGS][node_name].values())))
+                    tensor_list = [tensor for tensor in tensor_list if isinstance(tensor, KerasTensor)]
+                    assert len(tensor_list) >= len(values), f"{node_name} has mismatched number of inbound nodes"
+                    for idx, value in enumerate(values):
+                        if value == layer.name and tensor_list[idx].name in old_to_new_tensor_mapper:
+                            values[idx] = old_to_new_tensor_mapper[tensor_list[idx].name].name
+
+            # Update call_kwargs with new tensors
+            for _, kwargs_dict in self.model_layers_connections[ModelLayerConnectionsProperties.CALL_KWARGS].items():
+                for key, values in kwargs_dict.items():
+                    kwargs_dict[key] = self._update_nested_values(values, old_to_new_tensor_mapper)
+
+            # Update call_args with new tensors
+            for key, args in self.model_layers_connections[ModelLayerConnectionsProperties.CALL_ARGS].items():
+                self.model_layers_connections[ModelLayerConnectionsProperties.CALL_ARGS][key] = self._update_nested_values(args, old_to_new_tensor_mapper)
+
+        elif layer.name != new_output_tensor.name:
             new_name = new_output_tensor.name
             old_name_of_inputs = self.model_layers_connections[ModelLayerConnectionsProperties.INBOUND_NODES].pop(
                 layer.name
@@ -429,6 +492,18 @@ class _KerasModelPreparer:
                 if layer.name in value:
                     idx = value.index(layer.name)
                     value[idx] = new_name
+
+            # Update the kwargs dict in case there's keras tensor
+            # pylint: disable=protected-access
+            for _, kwargs_dict in self.model_layers_connections[ModelLayerConnectionsProperties.CALL_KWARGS].items():
+                for key, values in kwargs_dict.items():
+                    if isinstance(values, List):
+                        for i, value in enumerate(values):
+                            if isinstance(value, KerasTensor) and value._keras_history.layer.name == layer.name:
+                                values[i] = new_output_tensor
+                    elif isinstance(values, KerasTensor) and values._keras_history.layer.name == layer.name:
+                        kwargs_dict[key] = new_output_tensor
+
 
             self.model_layers_connections[ModelLayerConnectionsProperties.OUTPUT_TENSORS].update(
                 {new_name: new_output_tensor}
@@ -570,6 +645,35 @@ class _KerasModelPreparer:
 
         return self._prepare_model_helper(temp_model)
 
+    @staticmethod
+    def _get_keras_tensor_index(value: Any, search_list: List):
+        """
+        Helper function to check whether the value is a KerasTensor and return the index of it from the search_list
+        :param value: Value to search in the list
+        :param search_list: List to search
+        :return: Index of value in the search list
+        """
+        if not isinstance(value, KerasTensor):
+            return None
+        for idx, k_tensor in enumerate(search_list):
+            if isinstance(k_tensor, KerasTensor) and value.name == k_tensor.name:
+                return idx
+        return None
+
+    def _flatten_list(self, values: typing.List | typing.Tuple):
+        """
+        A helper function that returns flatten list of values in the given List or Tuple
+        :param values: List or Tuple of values
+        :return: List of flattened values
+        """
+        flat_vals = []
+        for val in values:
+            if isinstance(val, (typing.List, typing.Tuple)):
+                flat_vals.extend(self._flatten_list(val))
+            else:
+                flat_vals.append(val)
+        return flat_vals
+
     def _handle_normal_keras_layer(self, layer: tf.keras.layers.Layer) -> KerasTensor:
         """
         Helper function to handle normal keras layers. This function will create a new output tensor for the layer
@@ -578,6 +682,7 @@ class _KerasModelPreparer:
         :param layer: The layer to create the output tensor for
         :return: The output tensor of the layer
         """
+        # pylint: disable=too-many-branches, too-many-nested-blocks
         call_args = self._get_updated_call_args(layer)
 
         if isinstance(layer, TFOpLambda):
@@ -585,8 +690,26 @@ class _KerasModelPreparer:
                 # Special case for 'tf.concat' that takes a list of inputs with kwargs attached
                 # may need to updated in the future
 
-                if "concat" in layer.name:
+                # Remove keras tensor from call_args in case it is used in one of the keyword arguments
+                for _, values in call_kwargs.items():
+                    if not isinstance(values, List):
+                        values = [values]
+                    for value in values:
+                        keras_tensor_index = self._get_keras_tensor_index(value, call_args)
+                        if keras_tensor_index is not None:
+                            call_args.pop(keras_tensor_index)
+
+                if hasattr(layer, "function") and hasattr(layer.function, "__name__") and \
+                        layer.function.__name__ == "concat":
                     new_output_tensor = layer.call([*call_args], **call_kwargs)
+                elif hasattr(layer, "function") and hasattr(layer.function, "__name__") and \
+                        layer.function.__name__ == "cast":
+                    # Handling the case for cast op where the dtype of input tensor and the cast op is same
+                    source_tensor = call_kwargs['x'] if 'x' in call_kwargs else call_args[0]
+                    source_dtype = source_tensor.dtype
+                    target_dtype = call_kwargs['dtype'] if 'dtype' in call_kwargs else call_args[1].dtype
+                    new_output_tensor = source_tensor if source_dtype == target_dtype else \
+                        layer.call(*call_args, **call_kwargs)
                 else:
                     new_output_tensor = layer.call(*call_args, **call_kwargs)
             else:

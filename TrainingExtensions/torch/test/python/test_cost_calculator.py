@@ -44,7 +44,7 @@ import torch.nn as nn
 from aimet_common import cost_calculator as common_cost_calculator
 from aimet_common.defs import CostMetric, LayerCompRatioPair
 from aimet_common.utils import AimetLogger
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 from aimet_torch.channel_pruning.channel_pruner import (
     InputChannelPruner,
     ChannelPruningCostCalculator,
@@ -57,7 +57,7 @@ from aimet_torch.utils import (
 )
 from aimet_torch import cost_calculator as pt_cost_calculator
 
-from models import mnist_torch_model, test_models
+from .models import mnist_torch_model, test_models
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Test)
 

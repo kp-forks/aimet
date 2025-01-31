@@ -34,6 +34,7 @@
 #
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
+
 import contextlib
 import copy
 import logging
@@ -41,7 +42,7 @@ import os
 import tempfile
 from collections import defaultdict
 
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 import onnx
 import pytest
 import torch
@@ -56,7 +57,7 @@ from aimet_torch.onnx_utils import (
 )
 from torchvision import models
 
-from models.test_models import (
+from .models.test_models import (
     InputOutputDictModel,
     ModelWithModuleList,
     ModelWithReusedInitializers,
@@ -119,15 +120,6 @@ class HierarchicalMultiplyModule(torch.nn.Module):
         return self.mul2(x) * 6
 
 
-# helper method to restore prior state of the flag.
-@contextlib.contextmanager
-def onnx_simply(enable):
-    entry_state = onnx_utils.simplify_onnx_model
-    onnx_utils.simplify_onnx_model = enable
-    yield
-    onnx_utils.simplify_onnx_model = entry_state
-
-
 class TestOnnxUtils:
 
     @staticmethod
@@ -147,9 +139,8 @@ class TestOnnxUtils:
         dummy_input = torch.randn(1, 3, 224, 224)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            with onnx_simply(True):
-                onnx_utils.OnnxSaver.set_node_names(os.path.join(tmp_dir, model_name + '.onnx'), model, dummy_input,
-                                                    is_conditional=False, module_marker_map={})
+            onnx_utils.OnnxSaver.set_node_names(os.path.join(tmp_dir, model_name + '.onnx'), model, dummy_input,
+                                                is_conditional=False, module_marker_map={})
 
             onnx_model = onnx.load(os.path.join(tmp_dir,  model_name + '.onnx'))
             self.check_onnx_node_names(onnx_model)
@@ -176,9 +167,8 @@ class TestOnnxUtils:
         dummy_input = torch.randn(1, 16, 20, 20)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            with onnx_simply(True):
-                onnx_utils.OnnxSaver.set_node_names(os.path.join(tmp_dir,  model_name + '.onnx'), model, dummy_input,
-                                                    is_conditional=False, module_marker_map={})
+            onnx_utils.OnnxSaver.set_node_names(os.path.join(tmp_dir,  model_name + '.onnx'), model, dummy_input,
+                                                is_conditional=False, module_marker_map={})
 
             onnx_model = onnx.load(os.path.join(tmp_dir,  model_name + '.onnx'))
             self.check_onnx_node_names(onnx_model)
@@ -237,7 +227,7 @@ class TestOnnxUtils:
 
     def test_onnx_export_complex_model(self):
 
-        from aimet_torch.nn.modules.custom import Add
+        from aimet_torch._base.nn.modules.custom import Add
 
         class ResidualLayer1(torch.nn.Module):
             def __init__(self):
@@ -568,60 +558,6 @@ class TestOnnxUtils:
             for name in expected_nodes:
                 assert name in actual_nodes
 
-    def test_onnx_custom_param_mapping(self):
-        from aimet_torch.nn.modules.custom import Add
-
-        class GroupNormModel(torch.nn.Module):
-            def __init__(self):
-                super(GroupNormModel, self).__init__()
-                self.conv1 = torch.nn.Conv2d(10, 10, 3)
-                self.bn = torch.nn.BatchNorm2d(10)
-                self.gn = torch.nn.GroupNorm(2, 10)
-                self.add = Add()
-
-            def forward(self, x):
-                x = self.conv1(x)
-                y1 = self.bn(x)
-                y2 = self.gn(x)
-                return self.add(y1, y2)
-
-        model = GroupNormModel()
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            onnx_path = os.path.join(tmp_dir, 'MyModel.onnx')
-            onnx_utils.OnnxSaver.set_node_names(onnx_path, model, dummy_input=torch.rand(1, 10, 24, 24),
-                                                is_conditional=False, module_marker_map={})
-            onnx_model = onnx.load(onnx_path)
-            expected_node_names = ['conv1', 'bn', 'gn', 'add']
-
-            actual_node_names = [node.name for node in onnx_model.graph.node]
-            for name in expected_node_names:
-                assert name in actual_node_names
-
-            expected_param_names = {'conv1.weight', 'gn.bias', 'conv1.bias', 'gn.weight', 'bn.weight', 'bn.bias'}
-            _, valid_param_set = onnx_utils.OnnxSaver.get_onnx_node_to_io_tensor_names_map(onnx_model)
-            for name in expected_param_names:
-                assert name in valid_param_set
-
-            self.check_onnx_node_name_uniqueness(onnx_model)
-
-            # enable onnx simply
-            with onnx_simply(True):
-                onnx_utils.OnnxSaver.set_node_names(onnx_path, model, dummy_input=torch.rand(1, 10, 24, 24),
-                                                    is_conditional=False, module_marker_map={})
-            onnx_model = onnx.load(onnx_path)
-
-            actual_node_names = [node.name for node in onnx_model.graph.node]
-            for name in expected_node_names:
-                assert name in actual_node_names
-
-            params_names_removed = {'bn.running_mean', 'bn.running_var'}
-            _, valid_param_set = onnx_utils.OnnxSaver.get_onnx_node_to_io_tensor_names_map(onnx_model)
-            assert not params_names_removed.intersection(valid_param_set)
-            expected_param_names.difference_update(params_names_removed)
-            for name in expected_param_names:
-                assert name in valid_param_set
-
     @pytest.mark.parametrize("export_args", [None, {"opset_version": 12}])
     def test_set_node_name_for_matmul_add_linear(self, export_args):
         """
@@ -873,9 +809,8 @@ class TestOnnxUtils:
         dummy_input = torch.randn(1, 3, 224, 224)
         with tempfile.TemporaryDirectory() as tmp_dir:
             onnx_path= os.path.join(tmp_dir, model.__class__.__name__ + '.onnx')
-            with onnx_simply(True):
-                onnx_utils.OnnxSaver.set_node_names(onnx_path, model, dummy_input,
-                                                    is_conditional=False, module_marker_map={})
+            onnx_utils.OnnxSaver.set_node_names(onnx_path, model, dummy_input,
+                                                is_conditional=False, module_marker_map={})
 
             onnx_model = onnx.load(onnx_path)
             onnx.checker.check_model(onnx_model)
@@ -1089,3 +1024,41 @@ class TestOnnxUtils:
         assert (
             param_name_to_updated_name[param_name] == '/down_blocks.0/Add_1/Add_output_0_dup1'
         )
+
+    def test_node_names(self):
+        """ Check if the 'marked_module' string is removed correctly """
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = torch.nn.Conv2d(3, 3, 3)
+
+            def forward(self, x):
+                return self.conv1(x)
+
+
+        pt_model = Model().eval()
+        dummy_input = torch.randn(1, 3, 24, 24)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            torch.onnx.export(pt_model.eval(),
+                              dummy_input,
+                              os.path.join(tmp_dir, "model.onnx"),
+                              training=torch.onnx.TrainingMode.EVAL,
+                              export_params=True,
+                              input_names=['input'],
+                              output_names=['output'])
+            model = onnx.load_model(os.path.join(tmp_dir, "model.onnx"))
+
+            # Add 'marked_module' string in input and output field of onnx.GraphProto object.
+            model.graph.input[0].name = model.graph.input[0].name + '/marked_module'
+            model.graph.output[0].name = model.graph.input[0].name + '/marked_module'
+
+            # An exception should be raised since the node input/output names are not consistent.
+            from onnx.checker import ValidationError
+            with pytest.raises(ValidationError):
+                onnx.checker.check_model(model)
+
+            # Remove the 'marked_module' string
+            OnnxSaver._remove_marked_module_string_from_node_inp_out_names(model.graph)
+
+            # model should be consistent.
+            onnx.checker.check_model(model)

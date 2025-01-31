@@ -82,7 +82,7 @@ class GraphSearcher:
                             pattern_type.action(pattern_type, matched_ops_list)
                             logger.debug('found match: %s', matched_ops_list)
 
-    # pylint: disable=too-many-branches
+    # pylint: disable=too-many-branches, too-many-return-statements
     def _match_pattern(self, op, pattern, ignored_ops):
         if not pattern:
             return []
@@ -105,6 +105,8 @@ class GraphSearcher:
         if len(pattern) > 1:
             # Still more to match
             if not op.output:
+                return None
+            if len(op.output_ops) > 1: # Can't match patterns with branches
                 return None
             for child_op in op.output.consumers:
                 matched_child_ops = self._match_pattern(child_op, pattern[1:], ignored_ops)

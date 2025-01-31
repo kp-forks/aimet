@@ -224,7 +224,7 @@ class TestQuantizedTensor:
         """
         Then: 2) Returned tensor has values equivalent to calling quantize_dequantize(tensor, encoding.scale, encoding.offset, encoding.bitwidth)
         """
-        assert torch.allclose(dq_tensor, quantize_dequantize(tensor, scale, offset, bitwidth))
+        assert torch.allclose(dq_tensor, quantize_dequantize(tensor, scale, offset, bitwidth), atol=scale)
        
     @pytest.mark.cuda() 
     @pytest.mark.parametrize("devices", [(torch.device("cpu"), torch.device("cuda:0")),
@@ -374,6 +374,10 @@ class TestQuantizedTensor:
         lambda t : torch.tensor_split(t, 2),
         lambda t : torch.tile(t, (2, )),
         lambda t : t.as_strided((2, 64, 1), (1, 2, 1)),
+        lambda t : t.T,
+        lambda t : t.squeeze().H,
+        lambda t : t.mH,
+        lambda t : t.mT,
         torch.detach,
         torch.flatten,
         torch.clone,
@@ -687,3 +691,37 @@ class TestQuantizedTensor:
         for output in outputs:
             assert not isinstance(output, QuantizedTensorBase)
             assert not hasattr(output, 'encoding')
+
+    @pytest.mark.parametrize('qtensor_cls', [QuantizedTensor, DequantizedTensor])
+    def test_attribute_descriptor(self, qtensor_cls):
+        """
+        Given: torch.Tensor and a quantized/dequantized tensor with same dtype, device, shape, ...
+        When: Access the following attributes
+            * dtype
+            * device
+            * layout
+            * shape
+            * size()
+            * type()
+        Then: The attributes from both tensors should be value-equal and type-equal
+        """
+        tensor = torch.empty(10, 10)
+        qtensor = torch.empty(10, 10).as_subclass(qtensor_cls)
+
+        assert tensor.dtype == qtensor.dtype
+        assert type(tensor.dtype) == type(qtensor.dtype)
+
+        assert tensor.device == qtensor.device
+        assert type(tensor.device) == type(qtensor.device)
+
+        assert tensor.layout == qtensor.layout
+        assert type(tensor.layout) == type(qtensor.layout)
+
+        assert tensor.shape == qtensor.shape
+        assert type(tensor.shape) == type(qtensor.shape)
+
+        assert tensor.size() == qtensor.size()
+        assert type(tensor.size()) == type(qtensor.size())
+
+        assert tensor.type() == qtensor.type()
+        assert type(tensor.type()) == type(qtensor.type())

@@ -62,7 +62,7 @@ def implements(torch_function):
 
 class QuantizedTensorBase(torch.Tensor):
     """
-    Abstract base class to define quantized tensor behavior.
+    Abstract base class for quantized tensors.
     Represents a quantized or dequantized tensor as a subclass of :class:`torch.Tensor` which also holds the quantization encodings.
     This object can be safely quantized or dequantized through the :meth:`quantize` and :meth:`dequantize` methods without
     changing the represented data values.
@@ -89,6 +89,20 @@ class QuantizedTensorBase(torch.Tensor):
     """
 
     encoding: EncodingBase
+
+    _attr_descriptors = {
+        # attribute descriptor        attribute type
+        ( torch.Tensor.dtype.__get__,  torch.dtype),
+        ( torch.Tensor.device.__get__, torch.device),
+        ( torch.Tensor.layout.__get__, torch.layout),
+        ( torch.Tensor.shape.__get__,  torch.Size),
+        ( torch.Tensor.size,           torch.Size),
+        ( torch.Tensor.type,           str), # NOTE: Tensor.type is overloaded with two different specs:
+                                             #   1) Without argument: `tensor.type() -> str`;
+                                             #      should be considered a attribute descriptor
+                                             #   2) With arguments: `tensor.type(dtype) -> torch.Tensor`;
+                                             #      should be considered a typecasting operator
+    }
 
     _cast_ops = {
         torch.Tensor.half,
@@ -126,13 +140,16 @@ class QuantizedTensorBase(torch.Tensor):
         torch.Tensor.fliplr,
         torch.Tensor.flipud,
         torch.Tensor.gather,
+        torch.Tensor.H.__get__,
         torch.Tensor.hsplit,
         torch.Tensor.index_select,
         torch.Tensor.kthvalue,
         torch.Tensor.masked_select,
+        torch.Tensor.mH.__get__,
         torch.Tensor.movedim,
         torch.Tensor.moveaxis,
         torch.Tensor.msort,
+        torch.Tensor.mT.__get__,
         torch.Tensor.narrow,
         torch.Tensor.permute,
         torch.Tensor.repeat,
@@ -148,6 +165,7 @@ class QuantizedTensorBase(torch.Tensor):
         torch.Tensor.squeeze_,
         torch.Tensor.swapaxes,
         torch.Tensor.swapdims,
+        torch.Tensor.T.__get__,
         torch.Tensor.t,
         torch.Tensor.t_,
         torch.Tensor.take,
@@ -297,6 +315,9 @@ class QuantizedTensorBase(torch.Tensor):
             kwargs = kwargs if kwargs is not None else {}
             return HANDLED_FUNCTIONS[func](*args, **kwargs)
         ret = super().__torch_function__(func, types, args, kwargs)
+
+        if (func, type(ret)) in cls._attr_descriptors:
+            return ret
 
         self, *_ = args
 

@@ -43,10 +43,10 @@ import torch.nn.functional as F
 from aimet_torch import utils
 from aimet_torch.model_validator.model_validator import ModelValidator
 from aimet_torch.model_validator import validation_checks
-from models import test_models
+from .models import test_models
 from aimet_torch.meta import connectedgraph_utils
 from aimet_torch.model_preparer import prepare_model
-import aimet_torch.nn.modules.custom as aimet_modules
+import aimet_torch._base.nn.modules.custom as aimet_modules
 
 
 class CustomModule(torch.nn.Module):

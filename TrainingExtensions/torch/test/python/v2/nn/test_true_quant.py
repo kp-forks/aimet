@@ -35,6 +35,7 @@
 #  @@-COPYRIGHT-END-@@
 # =============================================================================
 
+import ast
 import functools
 import itertools
 from packaging import version
@@ -46,6 +47,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils._pytree import tree_flatten
 from torch.overrides import get_ignored_functions
+import transformers
+
 from aimet_torch.v2.quantization.affine.backends import quantize, quantize_dequantize, dequantize
 from aimet_torch.v2.quantization.affine import Quantize, QuantizeDequantize
 import aimet_torch.v2 as aimet
@@ -63,6 +66,7 @@ from aimet_torch.v2.nn import (
     QuantizedSoftmax,
     QuantizedLayerNorm,
     QuantizedGroupNorm,
+    UnknownModuleError,
 )
 from aimet_torch.v2.nn.fake_quant import _legacy_impl
 from aimet_torch.v2.nn.true_quant import _dispatch, _dispatch_table
@@ -637,10 +641,13 @@ class TestQuantizedLayers:
 
 
 def test_dispatch_sanity():
+    """
+    Given: custom_add(x, y) := x + y + 1
+    """
     custom_add = lambda *args, **kwargs: torch.add(*args, **kwargs) + 1
 
     """
-    When: Dispatch torch.add with custom_add(x, y) := x + y + 1
+    When: Dispatch custom_add in place of torch.add(x, y)
     Then: Output of torch.add(x, y) should be equal to x + y + 1
     """
     zeros = torch.zeros(10)
@@ -653,7 +660,7 @@ def test_dispatch_sanity():
     assert torch.all(out == 1)
 
     """
-    When: Dispatch torch.add with custom_add(x, y) := x + y + 1
+    When: Dispatch custom_add in place of torch.add
     Then: Output of the other functions should not be affected
     """
     with _dispatch(torch.add, custom_add):
@@ -677,6 +684,25 @@ def test_dispatch_sanity():
         dummy_impl = lambda *args, **kwargs: func(*args, **kwargs)
         with pytest.raises(RuntimeError):
             with _dispatch(func, dummy_impl): pass
+
+    """
+    When: Dispatch custom_addmm in place of torch.addmm in which
+          custom_add will be dispatched in place of torch.add in a nested fashion
+    Then: Output of torch.addmm(x, y, z) should be equal to x + (y @ z) + 1
+    """
+    x = torch.randn(10, 10)
+    y = torch.randn(10, 10)
+    z = torch.randn(10, 10)
+
+    def custom_addmm(x, y, z):
+        with _dispatch(torch.add, custom_add):
+            return torch.add(x, torch.matmul(y, z))
+
+    with _dispatch(torch.addmm, custom_addmm):
+        out = torch.addmm(x, y, z)
+
+    expected = x + (y @ z) + 1
+    assert torch.all(out == expected)
 
 
 def _create_legacy_fake_quantized_module(module):
@@ -895,10 +921,10 @@ def _create_quantized_module(module):
     (lambda: custom.Divide(),                         lambda: (randn(100), randn(100))),
     (lambda: custom.Concat(),                         lambda: (randn(1, 100), randn(3, 100))),
     # (lambda: custom.FloorDivide(),                  lambda: ...),
-    # (lambda: custom.Norm(),                         lambda: ...),
-    # (lambda: custom.Exponential(),                  lambda: ...),
-    # (lambda: custom.Erf(),                          lambda: ...),
-    # (lambda: custom.Sqrt(),                         lambda: ...),
+    (lambda: custom.Norm(),                           lambda: randn(100)),
+    (lambda: custom.Exponential(),                    lambda: randn(100)),
+    (lambda: custom.Erf(),                            lambda: randn(100)),
+    (lambda: custom.Sqrt(),                           lambda: randn(100).abs()),
     # (lambda: custom.Maximum(),                      lambda: ...),
     # (lambda: custom.Max(),                          lambda: ...),
     # (lambda: custom.AMax(),                         lambda: ...),
@@ -918,9 +944,9 @@ def _create_quantized_module(module):
     # (lambda: custom.Mean(),                         lambda: ...),
     # (lambda: custom.Sum(),                          lambda: ...),
     # (lambda: custom.Prod(),                         lambda: ...),
-    # (lambda: custom.Log(),                          lambda: ...),
-    # (lambda: custom.Abs(),                          lambda: ...),
-    # (lambda: custom.Neg(),                          lambda: ...),
+    (lambda: custom.Log(),                            lambda: randint(1, 1000, (10,10))),
+    (lambda: custom.Abs(),                            lambda: randn(100)),
+    (lambda: custom.Neg(),                            lambda: randn(100)),
     # (lambda: custom.Argmin(),                       lambda: ...),
     # (lambda: custom.Argmax(),                       lambda: ...),
     # (lambda: custom.ElementwiseCeil(),              lambda: ...),
@@ -949,11 +975,37 @@ def _create_quantized_module(module):
     # (lambda: custom.Interpolate(),                  lambda: ...),
     # (lambda: custom.MaxPool2d(),                    lambda: ...),
     # (lambda: custom.AdaptiveAvgPool2d(),            lambda: ...),
-    # (lambda: custom.BatchNorm(),                    lambda: ...),
-    # (lambda: custom.GroupNorm(),                    lambda: ...),
-    # (lambda: custom.Normalize(),                    lambda: ...),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10), zeros(10).requires_grad_(), ones(10).requires_grad_())),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10, 3, 2), zeros(10).requires_grad_(), ones(10).requires_grad_())),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10, 3, 2, 5), zeros(10).requires_grad_(), ones(10).requires_grad_())),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10), zeros(10), ones(10))),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10, 3, 2), zeros(10), ones(10))),
+    (lambda: custom.BatchNorm(),                      lambda: (randn(5, 10, 3, 2, 5), zeros(10), ones(10))),
+    (lambda: custom.GroupNorm(),                      lambda: (randn(20, 6, 10, 10), tensor(6))),
+    (lambda: custom.Normalize(),                      lambda: randn(100, 100)),
     # (lambda: custom.Pad(),                          lambda: ...),
-    # (lambda: custom.GridSample(),                   lambda: ...),
+    (lambda: custom.GridSample(),                     lambda: (randn(1, 3, 30, 30), randn(1, 3, 5, 2))),
+    (lambda: custom.RmsNorm([5, 2, 3], [2], 1e-5),    lambda: (randn(5, 2, 3))),
+    # (lambda custom.DynamicConv2d(),                 lambda: ...),
+    # (lambda custom.Pow(),                           lambda: ...),
+    # (lambda custom.CustomSiLU(),                    lambda: ...),
+    # (lambda custom.StridedSlice(),                  lambda: ...),
+    # (lambda custom.ChannelShuffle(),                lambda: ...),
+    # (lambda custom.Cast(),                          lambda: ...),
+    # (lambda custom.CustomGather(),                  lambda: ...),
+    # (lambda custom.DepthToSpaceCRDMode(),           lambda: ...),
+    # (lambda custom.DepthToSpaceDCRMode(),           lambda: ...),
+    # (lambda custom.CustomSparseConv3DLayer(),       lambda: ...),
+    # (lambda custom.SparseTensorWrapper(),           lambda: ...),
+    # (lambda custom.ScatterDense(),                  lambda: ...),
+    # (lambda custom.ScatterND(),                     lambda: ...),
+    # (lambda custom.RoiAlign(),                      lambda: ...),
+    # (lambda custom.NonMaxSuppression(),             lambda: ...),
+    # (lambda custom.GatherNd(),                      lambda: ...),
+    # (lambda custom.ScatterElements(),               lambda: ...),
+    # (lambda custom.OneHot(),                        lambda: ...),
+    # (lambda custom.Expand(),                        lambda: ...),
+    # (lambda custom.DynamicLinear(),                 lambda: ...),
 ]))
 def test_default_kernels(module_factory, input_factory):
     module = module_factory()
@@ -978,7 +1030,7 @@ def test_default_kernels(module_factory, input_factory):
 
 
     with qmodule.compute_encodings():
-        torch.manual_seed(0);
+        torch.manual_seed(0)
         _ = qmodule(*inputs)
 
     torch.manual_seed(0)
@@ -1001,3 +1053,25 @@ def test_default_kernels(module_factory, input_factory):
 
     for out_, tout_ in zip(tree_flatten(out)[0], tree_flatten(tout)[0]):
         assert torch.equal(out_, tout_)
+
+
+@pytest.mark.parametrize('module_cls', [
+    transformers.pytorch_utils.Conv1D,
+    # transformers.models.llama.modeling_llama.LlamaRotaryEmbedding, # requires latest transformer
+    # transformers.models.llama.modeling_llama.LlamaRMSNorm, # requires latest transformer
+    torch.nn.Linear,
+    custom.Multiply,
+    custom.MatMul,
+])
+def test_code_example(module_cls):
+    """
+    Given: A torch.nn.Module class defined with return annotation
+    When: Generate code example with _generate_code_example
+    Then: The generated code should be parseable by python interpreter
+    """
+    src_code = UnknownModuleError(module_cls, QuantizationMixin).generate_code_example()
+    try:
+        ast.parse(src_code)
+    except SyntaxError as e:
+        err = SyntaxError(f"The following code example is ill-formed:\n\n{src_code}")
+        raise err from e

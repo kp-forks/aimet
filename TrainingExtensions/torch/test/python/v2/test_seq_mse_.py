@@ -173,10 +173,10 @@ class TestSeqMse:
         xq = torch.randn(32, 4, 32, 64)
         with wrapper.param_quantizers['weight'].compute_encodings():
             _ = wrapper.param_quantizers['weight'](wrapper.weight.data)
-        before = wrapper.param_quantizers['weight'].get_encoding()
+        before = wrapper.param_quantizers['weight'].get_encodings()
         params = SeqMseParams(num_batches=32, loss_fn=loss_fn)
         optimize_module(wrapper, xq, xq, params)
-        after = wrapper.param_quantizers['weight'].get_encoding()
+        after = wrapper.param_quantizers['weight'].get_encodings()
 
         # If we use higher param_bw (for example 16, 31), then it should always choose larger candidates so
         # before and after param encodings should be almost same.
@@ -203,10 +203,10 @@ class TestSeqMse:
         xq = torch.randn(32, 1, 6, 10, 10)
         with wrapper.param_quantizers['weight'].compute_encodings():
             _ = wrapper.param_quantizers['weight'](wrapper.weight.data)
-        before = wrapper.param_quantizers['weight'].get_encoding()
+        before = wrapper.param_quantizers['weight'].get_encodings()
         params = SeqMseParams(num_batches=32, loss_fn=loss_fn)
         optimize_module(wrapper, xq, xq, params)
-        after = wrapper.param_quantizers['weight'].get_encoding()
+        after = wrapper.param_quantizers['weight'].get_encodings()
 
         # If we use higher param_bw (for example 16, 31), then it should always choose larger candidates so
         # before and after param encodings should be almost same.
@@ -238,9 +238,9 @@ class TestSeqMse:
         assert not sim.model.fc2.param_quantizers['weight']._allow_overwrite
 
         # Compute encodings for all the activations and remaining non-supported modules
-        enc_before = sim.model.fc1.param_quantizers['weight'].get_encoding()
+        enc_before = sim.model.fc1.param_quantizers['weight'].get_encodings()
         sim.compute_encodings(calibrate, dummy_input)
-        enc_after = sim.model.fc1.param_quantizers['weight'].get_encoding()
+        enc_after = sim.model.fc1.param_quantizers['weight'].get_encodings()
         assert enc_before.scale == enc_after.scale
 
     @pytest.mark.parametrize("inp_symmetry", ['asym', 'symfp', 'symqt'])
@@ -269,7 +269,7 @@ class TestSeqMse:
         assert not sim_without.model.fc2.param_quantizers['weight'].min.requires_grad
         assert not sim_without.model.fc2.param_quantizers['weight'].max.requires_grad
         assert not sim_without.model.fc2.param_quantizers['weight']._allow_overwrite
-        without_checkpoints_enc = sim_without.model.fc2.param_quantizers['weight'].get_encoding()
+        without_checkpoints_enc = sim_without.model.fc2.param_quantizers['weight'].get_encodings()
 
         # Apply Sequential MSE with checkpoints config
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -283,7 +283,7 @@ class TestSeqMse:
             assert not sim_with.model.fc2.param_quantizers['weight'].min.requires_grad
             assert not sim_with.model.fc2.param_quantizers['weight'].max.requires_grad
             assert not sim_with.model.fc2.param_quantizers['weight']._allow_overwrite
-            with_checkpoints_enc = sim_with.model.fc2.param_quantizers['weight'].get_encoding()
+            with_checkpoints_enc = sim_with.model.fc2.param_quantizers['weight'].get_encodings()
 
         # encodings should be bit-exact
         assert without_checkpoints_enc.min == with_checkpoints_enc.min
@@ -334,3 +334,35 @@ class TestSeqMse:
 
         assert torch.equal(out, out_3)
         assert not torch.equal(out, out_2)
+
+    @pytest.mark.parametrize('kwargs', [
+        dict(in_channels=16, out_channels=16, kernel_size=(3, 3), stride=2),
+        dict(in_channels=16, out_channels=16, kernel_size=(3, 3), padding=1),
+        dict(in_channels=16, out_channels=16, kernel_size=(3, 3), dilation=2),
+        dict(in_channels=16, out_channels=16, kernel_size=(3, 3), groups=16),
+        dict(in_channels=16, out_channels=16, kernel_size=(3, 3), groups=4),
+    ])
+    def test_non_default_conv(self, kwargs):
+        """
+        When: Run sequential MSE with conv2d with non-default arguments
+              (stride, padding, dilation, groups, ...)
+        Then: Shouldn't raise runtime error
+        """
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(**kwargs),
+        )
+        dummy_input = torch.randn(1, 16, 100, 100)
+        data_loader = (dummy_input,) * 2
+        sim = QuantizationSimModel(model, dummy_input, default_param_bw=4,
+                                   quant_scheme=QuantScheme.post_training_tf)
+        qconv = sim.model[0]
+        qconv.param_quantizers['weight'].min.copy_(-1)
+        qconv.param_quantizers['weight'].max.copy_(1)
+        sim.compute_encodings(lambda m: m(dummy_input))
+
+        params = SeqMseParams(num_batches=2, inp_symmetry='asym', loss_fn='mse')
+        apply_seq_mse(model, sim, data_loader, params)
+
+        # sanity check
+        assert qconv.param_quantizers['weight'].min != -1
+        assert qconv.param_quantizers['weight'].max != 1

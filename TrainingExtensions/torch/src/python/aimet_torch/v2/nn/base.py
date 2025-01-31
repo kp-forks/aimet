@@ -38,9 +38,11 @@
 
 import abc
 import contextlib
+import inspect
 import itertools
 from typing import Type, List, Dict, Union, Iterable, Mapping, Optional
 
+import torch
 import torch.nn as nn
 
 from aimet_torch.utils import is_vector_encoding
@@ -53,10 +55,135 @@ from aimet_torch.v2.utils import (
     _ContextManager,
     flatten_nn_module_list,
 )
-from aimet_torch.v2.deepspeed_utils import gathered_parameters, _shallow_copy
+from aimet_torch.v2.deepspeed_utils import SafeGatheredParameters, _shallow_copy
 
 def _no_op(in_tensor):
     return in_tensor
+
+
+class UnknownModuleError(RuntimeError):
+    """
+    Exception thrown when an unknown module is encountered
+    whose quantized definition isn't registered using @QuantizationMixin.implements().
+    """
+    module_cls: Type[torch.nn.Module]
+    mixin_cls: Type['BaseQuantizationMixin']
+    api_reference_url = "https://quic.github.io/aimet-pages/releases/" \
+                        "latest/apiref/torch/generated/" \
+                        "aimet_torch.nn.QuantizationMixin.html#aimet_torch.nn.QuantizationMixin.implements"
+
+    def __init__(self, module_cls: Type[torch.nn.Module], mixin_cls: Type['BaseQuantizationMixin']):
+        self.module_cls = module_cls
+        self.mixin_cls = mixin_cls
+        msg = self.generate_err_msg()
+        super().__init__(msg)
+
+    def generate_err_msg(self) -> str:
+        """ Generate error message """
+        module_cls = self.module_cls
+        mixin_cls = self.mixin_cls
+        code_example = self.generate_code_example()
+
+        return f'The quantized module definition of {module_cls} is not registered. ' \
+               f'Please register the quantized module definition of {module_cls} ' \
+               f'using `@{mixin_cls.__name__}.implements({module_cls.__name__})` decorator.\n\n' \
+               f"For example:\n\n{code_example}\n\n" \
+               f"For more details, please refer to the official API reference:\n{self.api_reference_url}"
+
+    def generate_code_example(self) -> str:
+        """ Generate code example """
+        module_cls = self.module_cls
+        mixin_cls = self.mixin_cls
+
+        forward_fn_signature = inspect.signature(module_cls.forward)
+        _, *forward_fn_args = list(forward_fn_signature.parameters.values())
+        ret_type = forward_fn_signature.return_annotation
+
+        if ret_type == inspect.Parameter.empty:
+            # if return annotation is unspecified, assume torch.Tensor as return type
+            ret_type = torch.Tensor
+
+        positional_or_keyword_args = [
+            arg for arg in forward_fn_args
+            if arg.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if positional_or_keyword_args != forward_fn_args:
+            # Module takes variable number of inputs (*args and/or **kwargs)
+            # In this case, only the user knows the proper number of input quantizers
+            _declare_input_quantizers = [
+                'self.input_quantizers = torch.nn.ModuleList(',
+                "    # <TODO: Declare the number of input quantizers here>",
+                ')',
+            ]
+            _quantize_inputs = [
+                "# <TODO: Quantize inputs as necessary>\n",
+            ]
+        else:
+            _declare_input_quantizers = [
+                f'self.input_quantizers = torch.nn.ModuleList({[None for _ in positional_or_keyword_args]})',
+            ]
+            _quantize_inputs = []
+            for i, arg in enumerate(positional_or_keyword_args):
+                _quantize_inputs += [
+                    f"if self.input_quantizers[{i}]:",
+                    f"    {arg.name} = self.input_quantizers[{i}]({arg.name})\n",
+                ]
+
+        if ret_type == torch.Tensor:
+            _declare_output_quantizers = [
+                'self.output_quantizers = torch.nn.ModuleList([None])',
+            ]
+            _quantize_outputs = [
+                "if self.output_quantizers[0]:",
+                "    ret = self.output_quantizers[0](ret)\n",
+            ]
+        else:
+            _declare_output_quantizers = [
+                "self.output_quantizers = torch.nn.ModuleList(",
+                "    # <TODO: Declare the number of output quantizers here>",
+                ")",
+            ]
+            _quantize_outputs = [
+                "# <TODO: Quantize `ret` as necessary>\n",
+            ]
+
+        def format_arg(arg: inspect.Parameter):
+            if arg.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                return arg.name
+            if arg.kind == inspect.Parameter.VAR_POSITIONAL:
+                return f"*{arg.name}"
+            if arg.kind == inspect.Parameter.KEYWORD_ONLY:
+                return f"{arg.name}={arg.name}"
+            if arg.kind == inspect.Parameter.VAR_KEYWORD:
+                return f"**{arg.name}"
+            raise RuntimeError
+
+        return '\n'.join([
+            f'@{mixin_cls.__name__}.implements({module_cls.__name__})',
+            f'class Quantized{module_cls.__name__}({mixin_cls.__name__}, {module_cls.__name__}):',
+             '    def __quant_init__(self):',
+             '        super().__quant_init__()',
+             '',
+             '        # Declare the number of input/output quantizers',
+          *(f'        {line}' for line in _declare_input_quantizers),
+          *(f'        {line}' for line in _declare_output_quantizers),
+             '',
+            f'    def forward{forward_fn_signature}:',
+             '        # Quantize input tensors',
+          *(f'        {line}' for line in _quantize_inputs),
+
+             '        # Run forward with quantized inputs and parameters',
+             '        with self._patch_quantized_parameters():',
+            f'            ret = super().forward({", ".join([format_arg(arg) for arg in forward_fn_args])})',
+             '',
+             '        # Quantize output tensors',
+          *(f'        {line}' for line in _quantize_outputs),
+
+             '        return ret',
+        ])
+
 
 
 class BaseQuantizationMixin(abc.ABC):
@@ -147,7 +274,7 @@ class BaseQuantizationMixin(abc.ABC):
         if not params:
             return
 
-        with gathered_parameters(params.values()):
+        with SafeGatheredParameters(params.values()):
             for param_qtzr, param in params.items():
                 with patch_attr(param_qtzr, "forward", _no_op), param_qtzr.compute_encodings():
                     _ = param_qtzr(param)
@@ -205,12 +332,31 @@ class BaseQuantizationMixin(abc.ABC):
     @classmethod
     def implements(cls, module_cls):
         """
-        Decorator for registering quantized implementation of the given base class.
+        Decorator for registering quantized definition of the given base class.
         """
 
         def wrapper(quantized_cls):
+            # pylint: disable=import-outside-toplevel
             cls.cls_to_qcls[module_cls] = quantized_cls
             cls.qcls_to_cls[quantized_cls] = module_cls
+
+            # Update the mapping from torch module to onnx op
+            # so v1 connected graph and quantsim configurator can properly handle quantized modules.
+            from aimet_torch.onnx_utils import map_torch_types_to_onnx
+            onnx_type = map_torch_types_to_onnx.get(module_cls, None)
+            if onnx_type:
+                map_torch_types_to_onnx[quantized_cls] = onnx_type
+
+            # Update the mapping from torch module to backend op
+            # so v1 connected graph and quantsim configurator can properly handle quantized modules.
+            # TODO: This unfortunately relies on the **class name** of the module, not the real type
+            #       of the module due to the limitation of v1 implementation.
+            #       Should redefine `aimet_to_to_backend_op_name_map` as `Dict[Type[Module], str]`
+            from aimet_torch.translation_mapping import aimet_op_to_backend_op_name_map # pylint:disable = cyclic-import
+            backend_op_name = aimet_op_to_backend_op_name_map.get(module_cls, None)
+            if backend_op_name:
+                aimet_op_to_backend_op_name_map[quantized_cls] = backend_op_name
+
             return quantized_cls
 
         return wrapper
@@ -224,29 +370,13 @@ class BaseQuantizationMixin(abc.ABC):
 
         :param module: Floating point module to quantize
         :return: Quantized version of the original module
-
-        Example:
-
-            >>> linear = torch.nn.linear(10, 10)
-            >>> quantized_linear = FakeQuantizationMixin.from_module(linear)
-            >>> print(quantized_linear.weight is linear.weight)
-            True
-            >>> print(quantized_linear.param_quantizers)
-            ModuleDict(
-                (weight): None
-                (bias): None
-            )
         """
         # pylint: disable=protected-access
         module_cls = type(module)
         qtzn_module_cls = cls.cls_to_qcls.get(module_cls, None)
 
         if not qtzn_module_cls:
-            raise RuntimeError(
-                f'The quantized module definition of {module_cls} is not registered. '
-                f'Please register the quantized module definition of {module_cls} '
-                f'using `@{cls.__name__}.implements({module_cls.__name__})` decorator.'
-            )
+            raise UnknownModuleError(module_cls, cls)
 
         qtzn_module = cls.__new__(qtzn_module_cls)
 
@@ -263,14 +393,17 @@ class BaseQuantizationMixin(abc.ABC):
         qtzn_module.__quant_init__()
         return qtzn_module
 
-    def export_input_encodings(self) -> List[List[Dict]]:
+    def export_input_encodings(self, encoding_version: str) -> List[List[Dict]]:
         """
         Returns a list of input encodings, each represented as a List of Dicts
         """
-        return [
-            quantizer.get_legacy_encodings() if isinstance(quantizer, QuantizerBase) else None
-            for quantizer in flatten_nn_module_list(self.input_quantizers)
-        ]
+        input_encodings = []
+        for quantizer in flatten_nn_module_list(self.input_quantizers):
+            if isinstance(quantizer, QuantizerBase) and quantizer.is_initialized():
+                input_encodings.append(quantizer.get_encodings().to_qnn_encoding_dict(encoding_version))
+            else:
+                input_encodings.append(None)
+        return input_encodings
 
     def import_input_encodings(self,
                                encodings: Mapping[str, Mapping],
@@ -302,7 +435,7 @@ class BaseQuantizationMixin(abc.ABC):
                 continue
             if quantizer is None:
                 if strict:
-                    raise RuntimeError
+                    raise RuntimeError(f"Failed to import input encoding at index {i}: no quantizer present.")
                 continue
             if isinstance(encoding, dict):
                 encoding = [encoding]
@@ -313,14 +446,17 @@ class BaseQuantizationMixin(abc.ABC):
 
             quantizer.allow_overwrite(allow_overwrite)
 
-    def export_output_encodings(self) -> List[List[Dict]]:
+    def export_output_encodings(self, encoding_version: str) -> List[List[Dict]]:
         """
         Returns a list of output encodings, each represented as a List of Dicts
         """
-        return [
-            quantizer.get_legacy_encodings() if isinstance(quantizer, QuantizerBase) else None
-            for quantizer in flatten_nn_module_list(self.output_quantizers)
-        ]
+        output_encodings = []
+        for quantizer in flatten_nn_module_list(self.output_quantizers):
+            if isinstance(quantizer, QuantizerBase) and quantizer.is_initialized():
+                output_encodings.append(quantizer.get_encodings().to_qnn_encoding_dict(encoding_version))
+            else:
+                output_encodings.append(None)
+        return output_encodings
 
     def import_output_encodings(self,
                                 encodings: Mapping[str, Mapping],
@@ -352,7 +488,7 @@ class BaseQuantizationMixin(abc.ABC):
                 continue
             if quantizer is None:
                 if strict:
-                    raise RuntimeError
+                    raise RuntimeError(f"Failed to import output encoding at index {i}: no quantizer present.")
                 continue
             if isinstance(encoding, dict):
                 encoding = [encoding]
@@ -363,22 +499,26 @@ class BaseQuantizationMixin(abc.ABC):
 
             quantizer.allow_overwrite(allow_overwrite)
 
-    def export_param_encodings(self) -> Dict[str, List[Dict]]:
+    def export_param_encodings(self, encoding_version: str) -> Dict[str, List[Dict]]:
         """
         Returns a dict of {param name: param encodings}, with each encoding represented as a List of Dicts
         """
-        encodings = {
-            param_name: quantizer.get_legacy_encodings() if isinstance(quantizer, QuantizerBase) else None
-            for param_name, quantizer in self.param_quantizers.items()
-        }
+        encodings = {}
+        for param_name, quantizer in self.param_quantizers.items():
+            if isinstance(quantizer, QuantizerBase) and quantizer.is_initialized():
+                encodings[param_name] = quantizer.get_encodings().to_qnn_encoding_dict(encoding_version)
+            else:
+                encodings[param_name] = None
+
         for param_name, quantizer in self.param_quantizers.items():
             param = getattr(self, param_name)
             if isinstance(quantizer, QuantizerBase):
-                e = encodings[param_name]
-            elif isinstance(param, QuantizedTensorBase) and param.encoding is not None:
+                # Already taken care of by earlier for loop
+                continue
+            if isinstance(param, QuantizedTensorBase) and param.encoding is not None:
                 # If parameter itself is an already-quantized tensor,
                 # export the encoding held by the parameter
-                e = param.encoding._to_legacy_format() # pylint: disable=protected-access
+                e = param.encoding.to_qnn_encoding_dict(encoding_version) # pylint: disable=protected-access
             else:
                 e = None
             encodings[param_name] = e
@@ -445,7 +585,7 @@ class BaseQuantizationMixin(abc.ABC):
                 continue
             if quantizer is None:
                 if strict:
-                    raise RuntimeError
+                    raise RuntimeError(f"Failed to import encoding for parameter {param_name}: no quantizer present.")
                 continue
             if isinstance(encoding, dict):
                 encoding = [encoding]

@@ -756,6 +756,7 @@ _AIMET_V1_BINARY_MODULES = [
     custom.LogicalAnd,
     custom.CustomGather,
     custom.GatherNd,
+    custom.GridSample,
 ]
 _AIMET_V1_TERNARY_MODULES = [
     custom.Baddbmm,
@@ -820,7 +821,7 @@ class FakeQuantizedBatchNorm(FakeQuantizationMixin, custom.BatchNorm): # pylint:
         if bias is not None and self.input_quantizers[4]:
             bias = self.input_quantizers[4](bias)
 
-        output = super().forward(input, running_mean, running_var,
+        output = super().forward(input, running_mean.detach(), running_var.detach(),
                                      weight, bias, training, momentum, eps)
 
         if self.output_quantizers[0]:
@@ -931,11 +932,11 @@ class FakeQuantizedConcat(FakeQuantizationMixin, custom.Concat):
         super().__quant_init__()
         self._num_inputs = 1
 
-    def export_input_encodings(self):
+    def export_input_encodings(self, encoding_version: str):
         """
         Extends super().export to repeat input quantizer's encodings :attr:`self._num_inputs` times
         """
-        input_encodings = super().export_input_encodings()
+        input_encodings = super().export_input_encodings(encoding_version)
         return input_encodings * self._num_inputs
 
     def import_input_encodings(self,

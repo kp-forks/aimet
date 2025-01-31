@@ -41,7 +41,7 @@ import copy
 from collections import OrderedDict
 import contextlib
 import weakref
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, TYPE_CHECKING
 import functools
 
 import torch
@@ -51,6 +51,11 @@ from torch.utils._pytree import tree_map
 from packaging import version  # pylint: disable=wrong-import-order
 from aimet_torch.v2.quantization.base import EncodingBase
 from aimet_torch.v2.quantization.encoding_analyzer import EncodingAnalyzer
+from aimet_torch.utils import deprecated
+
+if TYPE_CHECKING:
+    # pylint: disable=cyclic-import
+    from aimet_torch.v2.quantization.tensor import QuantizedTensorBase
 
 
 __all__ = ['QuantizerBase']
@@ -70,6 +75,16 @@ class QuantizerBase(abc.ABC, torch.nn.Module):
         # initialized after it was instantiated.
         self._initial_parameters = OrderedDict()
         self._allow_overwrite = True
+
+    def forward(self, input: torch.Tensor) -> 'QuantizedTensorBase': # pylint: disable=redefined-builtin
+        """
+        Quantize the input tensor
+
+        Args:
+            input (torch.Tensor): Input tensor to quantize
+        """
+        # Call parent's forward to throw NotImplementedError
+        return super().forward(input)
 
     @abc.abstractmethod
     @contextlib.contextmanager
@@ -91,10 +106,23 @@ class QuantizerBase(abc.ABC, torch.nn.Module):
         """
 
     @abc.abstractmethod
-    def get_encoding(self) -> Optional[EncodingBase]:
+    def get_encodings(self) -> Optional[EncodingBase]:
         """
         Return the quantizer's encodings as an EncodingBase object
         """
+
+    @deprecated(f"Use {get_encodings.__qualname__} instead")
+    def get_encoding(self) -> Optional[EncodingBase]:
+        """
+        Alias of get_encodings
+        """
+        return self.get_encodings()
+
+    def set_encodings(self, encodings: EncodingBase):
+        """
+        Set the quantizer's encodings
+        """
+        raise NotImplementedError
 
     def register_quantization_parameter(self, name: str, param: nn.Parameter):
         """

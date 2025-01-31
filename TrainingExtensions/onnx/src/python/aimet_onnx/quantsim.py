@@ -2,7 +2,7 @@
 # =============================================================================
 #  @@-COPYRIGHT-START-@@
 #
-#  Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+#  Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
 #  modification, are permitted provided that the following conditions are met:
@@ -36,35 +36,39 @@
 # =============================================================================
 """ Implementation for simulating models running on Quantized hardware """
 
+import contextlib
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 import os
 from typing import Dict, List, Union, Tuple, Optional
+import itertools
 import json
+import warnings
 import numpy as np
 import onnx
 
 from onnx import helper
-from onnxsim import simplify
 import onnxruntime as ort
 from onnxruntime import SessionOptions, GraphOptimizationLevel, InferenceSession
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
 from packaging import version
 
 # pylint: disable=wrong-import-order
-from aimet_common import libpymo
+from aimet_common import libpymo, quantsim
 from aimet_common import libquant_info
 from aimet_common.defs import QuantScheme, QuantizationDataType
-from aimet_common.quantsim import encoding_version, extract_global_quantizer_args
-from aimet_common.utils import save_json_yaml, AimetLogger
+from aimet_common.quantsim import extract_global_quantizer_args, VALID_ENCODING_VERSIONS
+from aimet_common.utils import save_json_yaml, AimetLogger, _red
+from aimet_common.connected_graph.product import Product
 from aimet_onnx import utils
 from aimet_onnx.meta.operations import Op
 from aimet_onnx.meta.utils import get_op_given_param_name, get_param_shape_using_connected_graph
 from aimet_onnx.meta.connectedgraph import ConnectedGraph
-from aimet_onnx.qc_quantize_op import QcQuantizeOp, OpMode, TensorQuantizerParams
+from aimet_onnx.qc_quantize_op import QcQuantizeOp, OpMode, TensorQuantizerParams, GroupedBlockQuantizeDequantize
 from aimet_onnx.quantsim_config.quantsim_config import QuantSimConfigurator
-from aimet_onnx.utils import make_dummy_input, add_hook_to_get_activation, remove_activation_hooks
+from aimet_onnx.utils import make_dummy_input, save_model_with_external_weights, add_hook_to_get_activation, \
+    remove_activation_hooks
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Quant)
 
@@ -83,7 +87,30 @@ op_params_to_ignore = ['Resize']
 
 allowed_op_type_for_per_channel = ['Conv', 'Gemm', 'MatMul', 'ConvTranspose']
 
+# List of op types whose input and output quantizers to be tied
+op_types_to_tie_qtzrs = ['Concat', 'MaxPool', 'AveragePool', 'Resize', 'Max', 'ReduceMax', 'Min', 'ReduceMin']
+_tie_qtzrs = False
+
 data_types_to_quantize = [np.float32]
+
+
+@contextlib.contextmanager
+def _apply_constraints(flag: bool):
+    """
+    Apply runtime specific constraints.
+    For certain ``op_types_to_tie_qtzrs``, runtime has constraints to have same encodings for
+     input and output quantizers.
+
+    NOTE: Default setting doesn't apply these constraints.
+    """
+    global _tie_qtzrs # pylint: disable=global-statement
+    orig_flag = _tie_qtzrs
+    try:
+        _tie_qtzrs = flag
+        yield
+    finally:
+        _tie_qtzrs = orig_flag
+
 
 @dataclass
 class EncodingMismatchInfo:
@@ -126,11 +153,11 @@ class QuantizationSimModel:
                  use_symmetric_encodings: bool = False, use_cuda: bool = True,
                  device: int = 0, config_file: str = None,
                  default_data_type: QuantizationDataType = QuantizationDataType.int,
-                 simplify_model: bool = True, user_onnx_libs: List[str] = None, path: str = None):
+                 user_onnx_libs: List[str] = None, path: str = None):
         """
         Constructor
 
-        :param model: ONNX model or path to model
+        :param model: ONNX model
         :param dummy_input: Dummy input to the model. If None, will attempt to auto-generate a dummy input
         :param quant_scheme: Quantization scheme (e.g. QuantScheme.post_training_tf)
         :param rounding_mode: Rounding mode (e.g. nearest)
@@ -143,21 +170,12 @@ class QuantizationSimModel:
                                  Possible options are QuantizationDataType.int and QuantizationDataType.float.
                                  Note that the mode default_data_type=QuantizationDataType.float is only supported with
                                  default_output_bw=16 and default_param_bw=16
-        :param simplify_model: Default True, uses onnx simplifier to simplify model
         :param user_onnx_libs: List of paths to all compiled ONNX custom ops libraries
         :param path: Directory to save the artifacts.
         """
         self.model = model
         if not isinstance(model, ONNXModel):
             self.model = ONNXModel(model)
-
-        if simplify_model:
-            try:
-                self.model.model, _ = simplify(self.model.model)
-            # pylint: disable=bare-except
-            except:
-                logger.info('ONNX Simplifier failed. Proceeding with unsimplified model.')
-
         if not dummy_input:
             dummy_input = make_dummy_input(self.model.model)
         self.qc_quantize_op_dict = {}
@@ -185,25 +203,27 @@ class QuantizationSimModel:
         self._path = path if path else tempfile.mkdtemp()
         if not os.path.exists(self._path):
             os.makedirs(self._path, exist_ok=True)
+
+        # Get names of parameters and activations to quantize
         self._get_param_names()
         self._get_activations_to_quantize(dummy_input)
 
         # Disable bias quantization
         self._disable_bias_quantization()
-
         self._add_quantization_nodes()
 
-        self.session = QuantizationSimModel.build_session(self.model.model, self.providers,
-                                                          user_onnx_libs=self._user_onnx_libs, path=self._path)
+        # Apply configurations based on provided config file.
         quantsim_configurator = self._add_configuration_(config_file)
-
         self._hw_version = quantsim_configurator._get_hw_version()
         self._supported_kernels = quantsim_configurator.get_supported_kernels()
         self._op_to_supported_kernel = quantsim_configurator.get_op_to_supported_kernels()
-
         self.quant_args = extract_global_quantizer_args(quant_scheme, quantsim_configurator)
-
         self._apply_exception_rules()
+        self._tie_quantizers()
+
+        # Build onnxruntime inference session
+        self.session = QuantizationSimModel.build_session(self.model.model, self.providers,
+                                                          user_onnx_libs=self._user_onnx_libs, path=self._path)
 
     def get_supported_kernels(self) -> Dict:
         """
@@ -252,7 +272,11 @@ class QuantizationSimModel:
 
         :param dummy_input: Sample input to be run through the model
         """
-        self.fill_activation_dtypes(dummy_input)
+        try:
+            self.activation_dtypes = self._infer_activation_dtypes()
+        except onnx.shape_inference.InferenceError:
+            self.activation_dtypes = self._observe_activation_dtypes(dummy_input)
+
         self.input_name_to_nodes = self.model.input_name_to_nodes()
         self.output_name_to_node = self.model.output_name_to_node()
 
@@ -348,9 +372,32 @@ class QuantizationSimModel:
                 return True
         return False
 
-    def fill_activation_dtypes(self, dummy_input: Dict[str, np.ndarray]):
+    def _infer_activation_dtypes(self):
         """
-        Get the data type for each activation
+        Get the data type for each activation through shape inference
+        """
+        if self.model.model.ByteSize() >= onnx.checker.MAXIMUM_PROTOBUF:
+            with tempfile.TemporaryDirectory(dir=self._path) as tempdir:
+                save_path = os.path.join(tempdir, "inferred_model.onnx")
+                save_model_with_external_weights(self.model.model, save_path, location=Path(save_path).name + ".data")
+                onnx.shape_inference.infer_shapes_path(save_path)
+                # Do not load the weights for the shape inference model, we only need to access the graph's `value_info`
+                inferred_model = onnx.load(save_path, load_external_data=False)
+        else:
+            inferred_model = onnx.shape_inference.infer_shapes(self.model.model)
+
+        activation_dtypes = {}
+        for val_info in itertools.chain(inferred_model.graph.value_info,
+                                        inferred_model.graph.input,
+                                        inferred_model.graph.output):
+            act_name = val_info.name
+            dtype = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[val_info.type.tensor_type.elem_type]
+            activation_dtypes[act_name] = dtype
+        return activation_dtypes
+
+    def _observe_activation_dtypes(self, dummy_input: Dict[str, np.ndarray]):
+        """
+        Get the data type for each activation by returning all activations
 
         :param dummy_input: Sample input to run through the model
         """
@@ -358,14 +405,17 @@ class QuantizationSimModel:
         hooks = []
         for name in activations:
             hooks.append(add_hook_to_get_activation(self.model.model, name))
-        sess = QuantizationSimModel.build_session(self.model.model, self.providers,
+        sess = QuantizationSimModel.build_session(self.model.model, ['CPUExecutionProvider'],
                                                   user_onnx_libs=self._user_onnx_libs, path=self._path)
         outputs = sess.run(None, dummy_input)
+
+        activation_dtypes = {}
         for idx in range(len(self.model.graph().output)):
             act_name = self.model.graph().output[idx].name
             dtype = outputs[idx].dtype
-            self.activation_dtypes[act_name] = dtype
+            activation_dtypes[act_name] = dtype
         remove_activation_hooks(self.model.model, hooks)
+        return activation_dtypes
 
     def _add_quantization_nodes(self):
         """
@@ -374,12 +424,24 @@ class QuantizationSimModel:
         self._insert_param_quantization_nodes()
         self._insert_activation_quantization_nodes()
 
+    def _replace_input_of_all_nodes(self, old_name, new_name):
+        if old_name not in self.connected_graph.get_all_products():
+            raise ValueError(f"Tensor name {old_name} was not found in graph tensors "
+                             f"{self.connected_graph.get_all_products().keys()}.")
+
+        product = self.connected_graph.get_all_products()[old_name]
+        for consumer in product.consumers:
+            node = consumer.get_module()
+            for idx, tensor in enumerate(node.input):
+                if tensor == old_name:
+                    node.input[idx] = new_name
+
     def _insert_param_quantization_nodes(self):
         """
         Insert quantization node for each param tensor
         """
         for name in self.param_names:
-            self.model.replace_input_of_all_nodes(name, name + '_qdq')
+            self._replace_input_of_all_nodes(name, name + '_qdq')
 
             quant_info, tensor_quantizer_params = self._create_quant_info_object_for_param(name)
             custom_node = helper.make_node(
@@ -395,7 +457,6 @@ class QuantizationSimModel:
             self.qc_quantize_op_dict[name] = QcQuantizeOp(quant_info=quant_info,
                                                           quant_scheme=self._quant_scheme,
                                                           rounding_mode=self._rounding_mode,
-                                                          encodings=None,
                                                           op_mode=OpMode.oneShotQuantizeDequantize,
                                                           bitwidth=self._default_param_bw,
                                                           use_symmetric_encodings=self._use_symmetric_encodings,
@@ -447,7 +508,7 @@ class QuantizationSimModel:
         Insert quantization node for each activation tensor
         """
         for name in self.activation_names:
-            self.model.replace_input_of_all_nodes(name, name + '_updated')
+            self._replace_input_of_all_nodes(name, name + '_updated')
             quant_info = libquant_info.QcQuantizeInfo()
             custom_node = helper.make_node(
                 op_type='QcQuantizeOp',
@@ -462,11 +523,9 @@ class QuantizationSimModel:
             self.qc_quantize_op_dict[name] = QcQuantizeOp(quant_info=quant_info,
                                                           quant_scheme=self._quant_scheme,
                                                           rounding_mode=self._rounding_mode,
-                                                          encodings=None,
                                                           op_mode=OpMode.updateStats,
                                                           bitwidth=self._default_activation_bw,
-                                                          use_symmetric_encodings=self._use_symmetric_encodings
-                                                          )
+                                                          use_symmetric_encodings=self._use_symmetric_encodings)
 
     @staticmethod
     def build_session(model: onnx.ModelProto, providers: List, user_onnx_libs: List[str] = None, path: str = None):
@@ -497,8 +556,7 @@ class QuantizationSimModel:
         output_path = os.path.join(path, 'model.onnx')
         if save_as_external_data:
             # Note: Saving as external data mutates the saved model, removing all initializer data
-            onnx.save_model(model, output_path, save_as_external_data=True, location=Path(output_path).name + ".data")
-            onnx.load_external_data_for_model(model, base_dir=path)
+            save_model_with_external_weights(model, output_path, location=Path(output_path).name + ".data")
 
         path_or_bytes = output_path if save_as_external_data else model.SerializeToString()
         session = InferenceSession(
@@ -525,32 +583,24 @@ class QuantizationSimModel:
         output_quantizers = []
         param_quantizers = {}
 
-        # Capture input quantizers if the op is a starting op
-        if op in self.connected_graph.starting_ops:
-            cg_products = [cg_product for cg_product in op.inputs if cg_product.is_model_input]
-            for cg_product in cg_products:
-                assert len(cg_product.tensor_dict) == 1
-                input_name = list(cg_product.tensor_dict.values())[0]
+        # Capture as input quantizer if tensor is not a layer output or parameter
+        for cg_product in op.inputs:
+            if not cg_product.producer and not cg_product.is_parm:
+                input_name = cg_product.name
                 if input_name in self.qc_quantize_op_dict:
                     input_quantizers.append(self.qc_quantize_op_dict[input_name])
 
         # Capture output quantizers of the op
-        if op.output_ops and op.output_ops[0].type == 'branch':
-            # op having multiple outputs
-            cg_product = op.output_ops[0].output
-        else:
-            # op having single output
-            cg_product = op.output
-        for output_name in set(cg_product.tensor_dict.values()):
-            if output_name in self.qc_quantize_op_dict:
-                output_quantizers.append(self.qc_quantize_op_dict[output_name])
+        cg_product = op.output
+        if cg_product.name in self.qc_quantize_op_dict:
+            output_quantizers.append(self.qc_quantize_op_dict[cg_product.name])
 
         # Capture param quantizers of the op
         for param_name, (_, param_type) in op.parameters.items():
             if param_name in self.qc_quantize_op_dict:
                 param_quantizers[param_type] = self.qc_quantize_op_dict[param_name]
 
-        return (input_quantizers, output_quantizers, param_quantizers)
+        return input_quantizers, output_quantizers, param_quantizers
 
     def _apply_exception_rules(self):
         """
@@ -678,54 +728,36 @@ class QuantizationSimModel:
                 qc_op.compute_encodings()
             qc_op.op_mode = OpMode.quantizeDequantize
 
-    @staticmethod
-    def _create_encoding_dict(encoding: libpymo.TfEncoding, qc_quantize_op: QcQuantizeOp) -> Union[Dict, None]:
-        """
-        Create encoding dictionary from encoding object
-        :param encoding: Encoding of the quantizer
-        :param qc_quantize_op: Quantizer
-        :return: Encoding Dictionary
-        """
-        data_type, bitwidth = qc_quantize_op.data_type, qc_quantize_op.bitwidth
+    def _get_encodings(self, quantizer_names, enc_version):
+        encoding_dict = {}
+        for name in quantizer_names:
+            encoding = self.qc_quantize_op_dict[name].export_encodings(enc_version)
+            if encoding is None:
+                continue
+            encoding_dict[name] = encoding
 
-        if data_type == QuantizationDataType.float:
-            enc_dict = {'bitwidth': bitwidth, 'dtype': "float"}
-        else:
-            if encoding:
-                encoding_min, encoding_max, bw, scale, offset = encoding.min, encoding.max, encoding.bw, \
-                                                                encoding.delta, encoding.offset
-                is_symmetric = qc_quantize_op.use_symmetric_encodings
+        if version.parse(enc_version) < version.parse("1.0.0"):
+            return encoding_dict
 
-                enc_dict = {'min': encoding_min, 'max': encoding_max, 'scale': scale, 'offset': int(offset),
-                            'bitwidth': bw, 'is_symmetric': str(is_symmetric), 'dtype': "int"}
-            else:
-                enc_dict = None
-        return enc_dict
+        for name, encoding in encoding_dict.items():
+            encoding["name"] = name
+        return list(encoding_dict.values())
 
     def _export_encodings(self, encoding_file_path):
         """
-        Export encodings to json and yaml file
+        Export encodings to json file
 
-        :param encoding_file_path: path to save the encoding files
+        :param encoding_file_path: path to save the encoding file
         """
+        enc_version = quantsim.encoding_version
+        if enc_version not in VALID_ENCODING_VERSIONS:
+            raise NotImplementedError(f'Encoding version {enc_version} not in set of valid encoding '
+                                      f'versions {VALID_ENCODING_VERSIONS}.')
 
-        def update_encoding_dict_entry(encoding_dict: Dict, op_name: str):
-            qc_quantize_op = self.qc_quantize_op_dict[op_name]
-            encoding_dict[op_name] = []
-            for encoding in qc_quantize_op.encodings:
-                encoding_dict[op_name].append(QuantizationSimModel._create_encoding_dict(encoding, qc_quantize_op))
+        param_encodings = self._get_encodings(self.param_names, enc_version)
+        activation_encodings = self._get_encodings(self.activation_names, enc_version)
 
-        param_encodings = {}
-        for name in self.param_names:
-            if self.qc_quantize_op_dict[name].enabled:
-                update_encoding_dict_entry(param_encodings, name)
-
-        activation_encodings = {}
-        for name in self.activation_names:
-            if self.qc_quantize_op_dict[name].enabled:
-                update_encoding_dict_entry(activation_encodings, name)
-
-        encodings_dict = {'version': encoding_version,
+        encodings_dict = {'version': enc_version,
                           'activation_encodings': activation_encodings,
                           'param_encodings': param_encodings,
                           'quantizer_args': self.quant_args}
@@ -764,12 +796,20 @@ class QuantizationSimModel:
         :param path: dir to save encoding files
         :param filename_prefix: filename to save encoding files
         """
+        if quantsim.encoding_version == '0.6.1':
+            msg = _red("Encoding version 0.6.1 will be deprecated in a future release, with version 1.0.0 becoming "
+                       "the default. If your code depends on parsing the exported encodings file, ensure that it is "
+                       "updated to be able to parse 1.0.0 format.\n"
+                       "To swap the encoding version to 1.0.0, run the following lines prior to calling quantsim "
+                       "export:\n\n"
+                       "from aimet_common import quantsim\n"
+                       "quantsim.encoding_version = '1.0.0'")
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
         self._export_encodings(os.path.join(path, filename_prefix) + '.encodings')
         self.remove_quantization_nodes()
         if self.model.model.ByteSize() >= onnx.checker.MAXIMUM_PROTOBUF:
             # Note: Saving as external data mutates the saved model, removing all initializer data
-            self.model.save_model_to_file(os.path.join(path, filename_prefix) + '.onnx', use_external_data_format=True)
-            onnx.load_external_data_for_model(self.model.model, base_dir=path)
+            save_model_with_external_weights(self.model.model, os.path.join(path, filename_prefix) + '.onnx')
         else:
             self.model.save_model_to_file(os.path.join(path, filename_prefix) + '.onnx')
 
@@ -812,6 +852,93 @@ class QuantizationSimModel:
             activation_quantizers.append(self.qc_quantize_op_dict[activation])
 
         return param_quantizers, activation_quantizers
+
+    def _tie_quantizers(self):
+        """
+        Tie the input and output quantizers for given op types.
+        """
+        if not _tie_qtzrs:
+            return
+
+        cg = self.connected_graph
+
+        def _set_quant_info(dst_qtzr_node_name: str, src_qtzr: QcQuantizeOp):
+            """
+            Set quant_info attribute (pointer to the libquant_info object)
+
+            :param dst_qtzr_node_name: destination quantizer node name in graph.
+            :param src_qtzr: source quantizer.
+            """
+            for node in self.model.graph().node:
+                if node.op_type == 'QcQuantizeOp' and node.name == dst_qtzr_node_name:
+                    for atr in node.attribute:
+                        if atr.name == "quant_info":
+                            atr.i = libpymo.PtrToInt64(src_qtzr.quant_info)
+                            return
+
+        def _set_qtzr(dst_qtzr: QcQuantizeOp, src_qtzr: QcQuantizeOp):
+            """
+            Set the dst quantizer by src quantizer and update quant_info attribute (pointer to the libquant_info object)
+             in the graph node.
+
+            :param dst_qtzr: destination quantizer.
+            :param src_qtzr: source quantizer
+            """
+            for name, qtzr in self.qc_quantize_op_dict.items():
+                if dst_qtzr == qtzr:
+                    self.qc_quantize_op_dict[name] = src_qtzr
+                    dst_qtzr_node_name = 'QcQuantizeOp_' + name
+                    # update quant_info attribute (pointer to the libquant_info object) in the graph node.
+                    _set_quant_info(dst_qtzr_node_name, src_qtzr)
+                    return
+
+        def _set_src_qtzr(x: Product, consumer: Op, src_qtzr):
+            producer = x.producer
+
+            if not producer:
+                # ``x`` is a root input (i.e. has no producer).
+                # In this case, set the input quantizer of the consumer to ``src_qtzr``
+                i = consumer.inputs.index(x)
+                inp_qtzr, _, __ = self.get_op_quantizers(consumer)
+                if i >= len(inp_qtzr):
+                    return
+
+                _set_qtzr(dst_qtzr=inp_qtzr[i], src_qtzr=src_qtzr)
+                return
+
+            _, out_qtzr, __ = self.get_op_quantizers(producer)
+
+            if out_qtzr:
+                # There exists output quantizer associated with the graph node ``producer``
+                # In this case, set the output quantizer of the producer to ``src_qtzr`
+                outputs = [producer.output]
+                i = outputs.index(x)
+                _set_qtzr(dst_qtzr=out_qtzr[i], src_qtzr=src_qtzr)
+
+            if not out_qtzr or producer.type in op_outputs_to_ignore:
+                # 1. There is no output quantizer associated with the graph node ``producer``, or
+                # 2. op is a math invariant op (reshape, permute, etc.).
+                # In these cases, propagate encoding further to the ancestors
+                for inp in producer.inputs:
+                    _set_src_qtzr(inp, consumer=producer, src_qtzr=src_qtzr)
+
+        for op in reversed(cg.ordered_ops):
+            if op.type not in op_types_to_tie_qtzrs:
+                continue
+
+            _, out_qtzr, __ = self.get_op_quantizers(op)
+
+            if not out_qtzr:
+                continue
+
+            if len(out_qtzr) != 1:
+                msg = 'Encoding propagation is only supported for ops with exactly ' \
+                      f'1 output quantizer, but found {len(out_qtzr)} ' \
+                      'output quantizers'
+                raise RuntimeError(msg)
+
+            for inp in op.inputs:
+                _set_src_qtzr(inp, consumer=op, src_qtzr=out_qtzr[0])
 
 
 def load_encodings_to_sim(quant_sim_model: QuantizationSimModel, onnx_encoding_path: str, strict=True) -> \
@@ -1045,9 +1172,9 @@ def set_blockwise_quantization_for_weights(sim: QuantizationSimModel,
                                            block_size: int,
                                            strict: bool = False):
     """
-    Set weight parameter quantizers of modules to blockwise.
+    Set weight quantizers for the given operator types to use blockwise affine quantization.
 
-    :param sim: Quantsim to set activation quantizers for
+    :param sim: Quantsim object to configure weight quantizers for
     :param op_types: Operator types for which to enable blockwise weight quantizaiton
     :param bitwidth: Bitwidth for quantization
     :param symmetric: True if quantization is symmetric, False otherwise
@@ -1061,7 +1188,7 @@ def set_blockwise_quantization_for_weights(sim: QuantizationSimModel,
         >>> # Assume 'sim' is a QuantizationSimModel object
         >>> # Allows setting of all Linear and Conv weight quantizers to block_size 64 in the input_channels dimension:
         >>> set_blockwise_quantization_for_weights(sim=sim,
-        ...                                        arg=("Gemm", "MatMul", "Conv"),
+        ...                                        op_types=("Gemm", "MatMul", "Conv"),
         ...                                        bitwidth=4,
         ...                                        symmetric=True,
         ...                                        block_size=64)
@@ -1086,3 +1213,75 @@ def set_blockwise_quantization_for_weights(sim: QuantizationSimModel,
                     weight_quantizer.set_bitwidth(bitwidth)
                     weight_quantizer.use_symmetric_encodings = symmetric
                     weight_quantizer.data_type = QuantizationDataType.int
+
+
+def set_grouped_blockwise_quantization_for_weights(sim: QuantizationSimModel,
+                                                   op_types: Union[str, Tuple],
+                                                   bitwidth: int,
+                                                   decompressed_bw: int,
+                                                   block_size: int,
+                                                   strict: bool = False):
+    """
+    Set weight parameter quantizers of modules to grouped blockwise quantization.
+
+    :param sim: Quantsim to set weight quantizers for
+    :param op_types: Operator types for which to enable grouped blockwise weight quantizaiton
+    :param bitwidth: Bitwidth for affine quantization
+    :param decompressed_bw: Decompressed bw for grouped block quantization
+    :param block_size: Block size for affine quantization. The block size will be applied to the weight's input features
+        dimension, while per-channel will be used for the weight's output features dimension
+
+    Examples:
+
+        >>> # Assume 'sim' is a QuantizationSimModel object
+        >>> # Sets of all Gemm, MatMul, and Conv weight quantizers to block_size 64 in the input_channels dimension:
+        >>> set_grouped_blockwise_quantization_for_weights(sim=sim,
+        ...                                                op_types=("Gemm", "MatMul", "Conv"),
+        ...                                                bitwidth=4,
+        ...                                                decompressed_bw=8,
+        ...                                                block_size=64)
+    """
+
+    if isinstance(op_types, str):
+        op_types = (op_types, )
+
+    for op in sim.connected_graph.ordered_ops:
+
+        if op.type in op_types:
+            _, _, param_quantizers = sim.get_op_quantizers(op)
+
+
+            if "weight" in param_quantizers.keys():
+                weight_quantizer: QcQuantizeOp = param_quantizers["weight"]
+
+                try:
+                    grouped_quantizer = GroupedBlockQuantizeDequantize(weight_quantizer.quant_info,
+                                                                       bitwidth,
+                                                                       decompressed_bw,
+                                                                       block_size,
+                                                                       weight_quantizer.quant_scheme,
+                                                                       weight_quantizer.op_mode,
+                                                                       weight_quantizer.tensor_quantizer_params)
+                except ValueError as e:
+                    if strict:
+                        raise e
+                else:
+                    for name, quantizer in sim.qc_quantize_op_dict.items():
+                        if quantizer is weight_quantizer:
+                            sim.qc_quantize_op_dict[name] = grouped_quantizer
+
+
+# pylint: disable=protected-access
+def clamp_activation_encodings(quant_sim: QuantizationSimModel, clamp_val: float):
+    """
+    Clamp activations to specific range if out of bound.
+
+    :param quant_sim: quantsim object
+    :param clamp_val: positive float value
+    :return:
+    """
+    for act_name in quant_sim.activation_names:
+        quantizer = quant_sim.qc_quantize_op_dict.get(act_name)
+        is_clipped = quantizer.clip_and_recompute_encodings(clamp_val)
+        if is_clipped:
+            logger.info("Clamped tensor %s", act_name)

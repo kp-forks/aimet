@@ -42,21 +42,27 @@ import torch
 
 try:
     from deepspeed.runtime.zero import ZeroParamStatus, GatheredParameters
+    from deepspeed.utils import safe_set_local_fp32_param
 
-    def gathered_parameters(params, *args, **kwargs):
+
+    class SafeGatheredParameters(GatheredParameters):
         """
         Shallow wrapper around ref:`GatheredParameters`.
         Unlike ref:`GatheredParameters`, this function can be also called
         with parameters that are already all-gathered by deepspeed zero3 or zero-offload runtime.
+        Additionally, this function ensure the synchronization of parameters.
         """
-        params = [
-            p for p in params
-            # Ignore if the parameter is already all-gathered.
-            # deepspeed.zero.runtime.GatheredParameters assumes all the parameters to be "NOT_AVAILABLE"
-            # and can fail if some of them were already "AVAILABLE".
-            if getattr(p, 'ds_status', None) == ZeroParamStatus.NOT_AVAILABLE
-        ]
-        return GatheredParameters(params, *args, **kwargs)
+        def __exit__(self, *exc):
+            super().__exit__(*exc)
+
+            if not self.enabled:
+                return
+
+            if self.src_rank is not None:
+                for param in self.params:
+                    if hasattr(param, "_z3_optimizer"):
+                        safe_set_local_fp32_param(param, param.ds_tensor)
+
 
     @contextlib.contextmanager
     def _do_patch_dummy_parameters(module):
@@ -82,9 +88,11 @@ try:
                 getattr(module, name).data = data
 
 except ImportError:
-    def gathered_parameters(*args, **kwargs): # pylint: disable=unused-argument
+    class SafeGatheredParameters(contextlib.nullcontext):
         """ Dummy placeholder in case deepspeed doesn't exist """
-        return contextlib.nullcontext()
+        def __init__(self, *args, **kwargs): # pylint: disable=unused-argument
+            super().__init__()
+
 
     def _do_patch_dummy_parameters(module): # pylint: disable=unused-argument
         """ Dummy placeholder in case deepspeed doesn't exist """
@@ -94,7 +102,7 @@ except ImportError:
 _ds_ctx = {}
 
 def _all_gather(module, _):
-    ctx = gathered_parameters(module.parameters(recurse=False))
+    ctx = SafeGatheredParameters(module.parameters(recurse=False))
     ctx.__enter__()
     _ds_ctx[module] = ctx
 
@@ -111,9 +119,8 @@ def _restore(module, *_):
 
 @contextlib.contextmanager
 def _register_zero3_forward_hooks(model: torch.nn.Module, use_dummy_params: bool):
-    handles = []
-
     # Temporarily materialize parameters to make forward runnable
+    handles = []
     materialize_parameters = _patch_dummy_parameters if use_dummy_params else _all_gather
     try:
         for module in model.modules():

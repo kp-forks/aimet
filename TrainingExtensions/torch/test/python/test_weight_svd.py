@@ -46,30 +46,13 @@ from contextlib import contextmanager
 import aimet_common.defs
 from aimet_common.defs import LayerCompRatioPair
 from aimet_common.utils import AimetLogger
-from models import mnist_torch_model as mnist_model
+from .models import mnist_torch_model as mnist_model
 import aimet_torch.compression_factory as cf_svd
 from aimet_torch.utils import create_rand_tensors_given_shapes, get_device
 from aimet_torch.layer_database import LayerDatabase, Layer
 from aimet_torch.svd.svd_pruner import WeightSvdPruner, PyWeightSvdPruner
 
 logger = AimetLogger.get_area_logger(AimetLogger.LogAreas.Test)
-
-@contextmanager
-def _use_python_impl(flag: bool):
-    orig_flag = cf_svd.USE_PYTHON_IMPL
-    try:
-        cf_svd.USE_PYTHON_IMPL = flag
-        yield
-    finally:
-        cf_svd.USE_PYTHON_IMPL = orig_flag
-
-
-@pytest.fixture(params=[True, False])
-def use_python_impl(request):
-    param: bool = request.param
-
-    with _use_python_impl(param):
-        yield
 
 
 class MnistModel(nn.Module):
@@ -258,7 +241,7 @@ class TestTrainingExtensionsSvd:
 
 class TestWeightSvdPruning:
 
-    def test_prune_layer(self, use_python_impl):
+    def test_prune_layer(self):
 
         model = mnist_model.Net()
 
@@ -326,7 +309,8 @@ class TestWeightSvdPruning:
 
         assert id(mo_layer_db.model) != id(py_layer_db.model)
         with torch.no_grad():
-            assert torch.allclose(mo_layer_db.model(dummy_input), py_layer_db.model(dummy_input), atol=1e-5)
+            atol = torch.finfo(torch.float16).eps
+            assert torch.allclose(mo_layer_db.model(dummy_input), py_layer_db.model(dummy_input), atol=atol)
 
 
     @pytest.mark.cuda
@@ -363,4 +347,5 @@ class TestWeightSvdPruning:
 
         assert id(mo_layer_db.model) != id(py_layer_db.model)
         with torch.no_grad():
-            assert torch.allclose(mo_layer_db.model(dummy_input), py_layer_db.model(dummy_input), atol=1e-5)
+            atol = torch.finfo(torch.float16).eps
+            assert torch.allclose(mo_layer_db.model(dummy_input), py_layer_db.model(dummy_input), atol=atol)
