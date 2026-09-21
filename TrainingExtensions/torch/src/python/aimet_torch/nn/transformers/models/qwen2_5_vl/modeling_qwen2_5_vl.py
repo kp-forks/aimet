@@ -23,13 +23,18 @@ except AttributeError:
     # Fall back to old name for transformers < 5.0
     _BaseRMSNorm = modeling_qwen2_5_vl.Qwen2RMSNorm
 
+try:
+    _BaseVisionRotaryEmbedding = modeling_qwen2_5_vl.Qwen2_5_VisionRotaryEmbedding
+except AttributeError:
+    _BaseVisionRotaryEmbedding = modeling_qwen2_5_vl.Qwen2_5_VLVisionRotaryEmbedding
+
 # Map to ONNX RMSNormalization so that
 # quantsim config for RMSNormalization will be applied to Qwen RMSNorm
 map_torch_types_to_onnx[_BaseRMSNorm] = ["RMSNormalization"]
 
 # Don't simulate quantization on rotary embedding layers
 QuantizationMixin.ignore(modeling_qwen2_5_vl.Qwen2_5_VLRotaryEmbedding)
-QuantizationMixin.ignore(modeling_qwen2_5_vl.Qwen2_5_VisionRotaryEmbedding)
+QuantizationMixin.ignore(_BaseVisionRotaryEmbedding)
 
 
 @QuantizationMixin.implements(_BaseRMSNorm)
