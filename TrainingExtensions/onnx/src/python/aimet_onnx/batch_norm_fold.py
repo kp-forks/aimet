@@ -19,6 +19,7 @@ from aimet_onnx.common.graph_pattern_matcher import PatternType
 from aimet_onnx.common.graph_searcher import GraphSearcher
 from aimet_onnx.common.connected_graph.connectedgraph_utils import get_ordered_ops
 from aimet_onnx.common.utils import AimetLogger
+from aimet_onnx.common.onnx._utils import to_array
 
 from aimet_onnx.meta.connectedgraph import ConnectedGraph
 from aimet_onnx.meta.connectedgraph import (
@@ -301,9 +302,9 @@ def _fold_to_weight(
         conv_linear.input.append(bias_name)
         bias = ParamUtils.get_param(model, conv_linear, BIAS_INDEX)
 
-    weight_np = numpy_helper.to_array(weight)
+    weight_np = to_array(weight)
     weight_np = np.expand_dims(weight_np, axis=tuple(range(weight_np.ndim, 4)))
-    bias_np = numpy_helper.to_array(bias)
+    bias_np = to_array(bias)
 
     # Transpose weights to C, N, H, W from N, C, H, W since axis are flipped for transposed conv
     # However depthwise conv layers are always N, 1, H, W whether transposed-conv or not, so no need to transpose
@@ -321,11 +322,11 @@ def _fold_to_weight(
     mu = ParamUtils.get_param(model, bn, RUNNING_MEAN_INDEX)
     running_var = ParamUtils.get_param(model, bn, RUNNING_VAR_INDEX)
 
-    gamma_np = numpy_helper.to_array(gamma)
-    beta_np = numpy_helper.to_array(beta)
-    mu_np = numpy_helper.to_array(mu)
+    gamma_np = to_array(gamma)
+    beta_np = to_array(beta)
+    mu_np = to_array(mu)
     epsilon = get_node_attribute(bn, "epsilon") or 1e-5
-    sigma_np = np.sqrt(numpy_helper.to_array(running_var) + epsilon)
+    sigma_np = np.sqrt(to_array(running_var) + epsilon)
 
     # In the case of BatchNorm2d -> Flatten -> Gemm, must resize the BN parameters to the Gemm input feature length
     channels = weight_np.shape[0] if fold_backward else weight_np.shape[1]
@@ -568,8 +569,8 @@ def _has_batchnorms_with_fusable_running_stats(model: ModelProto) -> bool:
 
         init_rm, init_rv = inits[2], inits[3]
 
-        tensor_rm = numpy_helper.to_array(init_rm)
-        tensor_rv = numpy_helper.to_array(init_rv)
+        tensor_rm = to_array(init_rm)
+        tensor_rv = to_array(init_rv)
         if not np.allclose(tensor_rm, 0) or not np.allclose(tensor_rv, 1):
             return True
 

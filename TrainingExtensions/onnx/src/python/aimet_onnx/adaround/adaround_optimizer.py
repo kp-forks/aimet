@@ -17,6 +17,7 @@ from packaging import version
 
 # Import AIMET specific modules
 from aimet_onnx.common.utils import AimetLogger
+from aimet_onnx.common.onnx._utils import to_array
 from aimet_onnx.adaround.activation_sampler import ActivationSampler
 from aimet_onnx.quantsim import QuantizationSimModel
 from aimet_onnx.adaround.utils import (
@@ -78,9 +79,9 @@ class AdaroundOptimizer:
             module.params["weight"].name
         ]
         torch_device = get_torch_device(quant_model.session)
-        weights = torch.from_numpy(
-            numpy_helper.to_array(module.params["weight"].tensor)
-        ).to(torch_device)
+        weights = torch.from_numpy(to_array(module.params["weight"].tensor)).to(
+            torch_device
+        )
         enable_grad(weights)
 
         adaround_quantizer.broadcast_offset_delta(weights)
@@ -258,7 +259,7 @@ class AdaroundOptimizer:
             bias = None
             if "bias" in quant_module.params:
                 bias = torch.from_numpy(
-                    numpy_helper.to_array(quant_module.params["bias"].tensor)
+                    to_array(quant_module.params["bias"].tensor)
                 ).to(device)
             out_data = functional.conv2d(
                 inp_data,
@@ -279,7 +280,7 @@ class AdaroundOptimizer:
             bias = None
             if "bias" in quant_module.params:
                 bias = torch.from_numpy(
-                    numpy_helper.to_array(quant_module.params["bias"].tensor)
+                    to_array(quant_module.params["bias"].tensor)
                 ).to(device)
             out_data = functional.conv_transpose2d(
                 inp_data,
@@ -297,7 +298,7 @@ class AdaroundOptimizer:
             bias = None
             if "bias" in quant_module.params:
                 bias = torch.from_numpy(
-                    numpy_helper.to_array(quant_module.params["bias"].tensor)
+                    to_array(quant_module.params["bias"].tensor)
                 ).to(device)
             out_data = functional.linear(inp_data, adarounded_weights, bias=bias)
         elif quant_module.type in ["MatMul"]:

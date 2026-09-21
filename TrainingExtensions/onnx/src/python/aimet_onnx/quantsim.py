@@ -32,7 +32,6 @@ import onnx_ir
 from onnx_ir.passes.common import ShapeInferencePass
 
 from onnx import helper
-from onnx.numpy_helper import to_array
 import onnxruntime as ort
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
 from packaging import version
@@ -61,6 +60,7 @@ from aimet_onnx.common.onnx._utils import (
     _is_htp_interpolation_op,
     _get_all_constants,
     contains_tensor_type,
+    to_array,
 )
 from aimet_onnx.graph_passes.cleanup import remove_duplicate_qdq_pairs
 from aimet_onnx.common.quantsim import (
@@ -1649,9 +1649,7 @@ class QuantizationSimModel:
                 continue
 
             bias_float = (
-                onnx.numpy_helper.to_array(bias_proto)
-                if bias_proto
-                else np.zeros_like(weight_scale)
+                to_array(bias_proto) if bias_proto else np.zeros_like(weight_scale)
             )
 
             encodings = weight_qtzr.get_encodings()

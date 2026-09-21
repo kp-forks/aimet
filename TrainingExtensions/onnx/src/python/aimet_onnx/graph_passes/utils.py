@@ -5,8 +5,8 @@
 
 from aimet_onnx.common.connected_graph.operation import Op, Product
 from aimet_onnx.utils import ParamUtils, ModelProto
+from aimet_onnx.common.onnx._utils import to_array
 
-from onnx import numpy_helper
 import numpy as np
 from typing import List, Tuple, Optional, Union
 
@@ -22,7 +22,7 @@ def _get_numpy_array(model: ModelProto, param_name: str) -> Optional[np.ndarray]
     Returns:
         Optional[nd.array]: returns nd.array if parameter exists. Otherwise, None.
     """
-    return numpy_helper.to_array(ParamUtils.get_param_by_name(model, param_name))
+    return to_array(ParamUtils.get_param_by_name(model, param_name))
 
 
 def is_constant_scalar(

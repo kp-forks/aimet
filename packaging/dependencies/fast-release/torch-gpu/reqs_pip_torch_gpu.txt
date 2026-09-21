@@ -7,7 +7,7 @@ jsonschema
 matplotlib>=3
 networkx
 numpy
-onnx<1.23.0
+onnx
 onnx_ir>=0.1.16
 onnxscript>=0.2.0
 osqp

@@ -1,7 +1,7 @@
 # Universal test dependencies
 beautifulsoup4
 matplotlib
-onnx<1.23.0
+onnx
 protobuf<7
 pydantic
 pylint<4

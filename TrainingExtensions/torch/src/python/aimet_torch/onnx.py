@@ -29,6 +29,7 @@ from aimet_torch.common.onnx._utils import (
     _derive_const_rescale_op_output_encodings,
     contains_tensor_type,
     _remove_onnx_qdq_nodes,
+    to_array,
 )
 
 from .nn import QuantizationMixin
@@ -743,7 +744,7 @@ def _onnx_encoding_equal(
             raise RuntimeError(
                 f"Cannot find constant with name {qdq_node.input[1]} in onnx model"
             )
-        return onnx.numpy_helper.to_array(scale_proto, base_dir=base_dir)
+        return to_array(scale_proto, base_dir=base_dir)
 
     def get_zero_point(qdq_node: onnx.NodeProto) -> np.ndarray | None:
         if len(qdq_node.input) < 3:
@@ -756,7 +757,7 @@ def _onnx_encoding_equal(
                 f"Cannot find constant with name {qdq_node.input[2]} in onnx model"
             )
 
-        zp = onnx.numpy_helper.to_array(zp_proto, base_dir=base_dir)
+        zp = to_array(zp_proto, base_dir=base_dir)
 
         if np.all(zp == 0):
             zp = None
@@ -821,7 +822,7 @@ def _encoding_equal(
             raise RuntimeError(
                 f"Cannot find constant with name {qdq_node.input[1]} in onnx model"
             )
-        return onnx.numpy_helper.to_array(scale_proto, base_dir=base_dir)
+        return to_array(scale_proto, base_dir=base_dir)
 
     def get_offset(qdq_node: onnx.NodeProto) -> np.ndarray | None:
         if len(qdq_node.input) < 3:
@@ -834,7 +835,7 @@ def _encoding_equal(
                 f"Cannot find constant with name {qdq_node.input[2]} in onnx model"
             )
 
-        offset = onnx.numpy_helper.to_array(offset_proto, base_dir=base_dir)
+        offset = to_array(offset_proto, base_dir=base_dir)
 
         if np.all(offset == 0):
             offset = None
@@ -964,7 +965,7 @@ def _fold_linear_weight_transpose(onnx_model: onnx.ModelProto, base_dir):
     def transpose_2d(tensor: onnx.TensorProto) -> onnx.TensorProto:
         assert len(tensor.dims) <= 2
         transposed = onnx.numpy_helper.from_array(
-            onnx.numpy_helper.to_array(tensor, base_dir=base_dir).T,
+            to_array(tensor, base_dir=base_dir).T,
             name=get_new_name(tensor.name),
         )
         transposed.dims[:] = [

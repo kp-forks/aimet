@@ -18,7 +18,7 @@ import tempfile
 import numpy as np
 import onnx
 from onnx import ModelProto, NodeProto, TensorProto
-from onnx.numpy_helper import from_array, to_array
+from onnx.numpy_helper import from_array
 from onnx.external_data_helper import (
     load_external_data_for_tensor,
     uses_external_data,
@@ -1986,3 +1986,18 @@ def _derive_const_rescale_op_output_encodings(
 
     new_encodings = {k: v for k, v in updated_encodings.items() if k not in encodings}
     return new_encodings
+
+
+def to_array(tensor: onnx.TensorProto, base_dir: str = "") -> np.ndarray:
+    had_raw_data = tensor.HasField("raw_data")
+    try:
+        return onnx.numpy_helper.to_array(tensor, base_dir=base_dir)
+    finally:
+        # onnx.numpy_helper.to_array() populates raw_data for external tensors.
+        # As a result, the subsequent onnx.save_model() attempts to rewrite
+        # the existing external data file, which conflicts with the new 1.23
+        # policy that only allows appending but not rewriting.
+        # For more information, see https://github.com/onnx/onnx/issues/8471
+        # Therefore, restore raw_data to its original state before saving.
+        if not had_raw_data:
+            tensor.ClearField("raw_data")

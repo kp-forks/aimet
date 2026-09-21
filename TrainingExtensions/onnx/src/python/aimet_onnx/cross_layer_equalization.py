@@ -12,11 +12,11 @@ Layer groups: Groups of layers that are immediately connected and can be decompo
 from typing import List, Optional, Tuple, Union, Dict
 import numpy as np
 import onnx
-from onnx import numpy_helper
 from onnxruntime.quantization.onnx_quantizer import ONNXModel
 from packaging import version
 
 from aimet_onnx.common.utils import AimetLogger
+from aimet_onnx.common.onnx._utils import to_array
 from aimet_onnx.common.connected_graph.connectedgraph import get_ordered_ops
 from aimet_onnx.common.cross_layer_equalization import (
     GraphSearchUtils,
@@ -195,11 +195,11 @@ class PythonClsImpl(ClsImpl):
         weight_1, bias_1 = self._get_weight_bias(conv_1)
         weight_2, _ = self._get_weight_bias(conv_2)
 
-        weight_0_np = numpy_helper.to_array(weight_0)
-        weight_1_np = numpy_helper.to_array(weight_1)
-        weight_2_np = numpy_helper.to_array(weight_2)
-        bias_0_np = None if bias_0 is None else numpy_helper.to_array(bias_0)
-        bias_1_np = None if bias_1 is None else numpy_helper.to_array(bias_1)
+        weight_0_np = to_array(weight_0)
+        weight_1_np = to_array(weight_1)
+        weight_2_np = to_array(weight_2)
+        bias_0_np = None if bias_0 is None else to_array(bias_0)
+        bias_1_np = None if bias_1 is None else to_array(bias_1)
 
         # Expand 3D weights (Conv1d) to 4D weights (Conv2d)
         while weight_0_np.ndim < 4:
@@ -273,9 +273,9 @@ class PythonClsImpl(ClsImpl):
         weight_0, bias_0 = self._get_weight_bias(conv_0)
         weight_1, _ = self._get_weight_bias(conv_1)
 
-        weight_0_np = numpy_helper.to_array(weight_0)
-        weight_1_np = numpy_helper.to_array(weight_1)
-        bias_0_np = None if bias_0 is None else numpy_helper.to_array(bias_0)
+        weight_0_np = to_array(weight_0)
+        weight_1_np = to_array(weight_1)
+        bias_0_np = None if bias_0 is None else to_array(bias_0)
 
         # Expand 3D weights (Conv1d) to 4D weights (Conv2d)
         while weight_0_np.ndim < 4:
@@ -421,9 +421,9 @@ class PythonHbfImpl(HbfImpl):
         _, bias_prev = self._get_weight_bias(prev)
         weight_curr, bias_curr = self._get_weight_bias(curr)
 
-        bias_prev_np = numpy_helper.to_array(bias_prev)
-        weight_curr_np = numpy_helper.to_array(weight_curr)
-        bias_curr_np = numpy_helper.to_array(bias_curr)
+        bias_prev_np = to_array(bias_prev)
+        weight_curr_np = to_array(weight_curr)
+        bias_curr_np = to_array(bias_curr)
 
         # Expand 3D weights (Conv1d) to 4D weights (Conv2d)
         while weight_curr_np.ndim < 4:

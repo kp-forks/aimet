@@ -31,6 +31,7 @@ from aimet_onnx.common.onnx._utils import (  # pylint: disable=unused-import
     _ParamUtils,
     _get_node_attribute as get_node_attribute,
     contains_tensor_type,
+    to_array,
 )
 from packaging import version
 
@@ -209,7 +210,7 @@ def transpose_tensor(t: TensorProto, axes: Union[List, Tuple]) -> TensorProto:
     :param axes: tuple or list containing the permuted axis ordering
     :return: t permuted according to the axis ordering in axes
     """
-    t_np = numpy_helper.to_array(t)
+    t_np = to_array(t)
     # Expand tensor with singleton dimensions to match axes
     while len(t_np.shape) < len(axes):
         t_np = np.expand_dims(t_np, len(t_np.shape))
@@ -341,7 +342,7 @@ def check_if_clip_node_minimum_is_zero(node: NodeProto, model: ModelProto):
                 if (
                     hasattr(node_graph, "attribute")
                     and hasattr(node_graph.attribute[0], "t")
-                    and numpy_helper.to_array(node_graph.attribute[0].t) == 0
+                    and to_array(node_graph.attribute[0].t) == 0
                 ):
                     return True
     elif (

@@ -35,6 +35,7 @@ from aimet_torch.utils import patch_attr
 from aimet_torch.common.onnx._utils import (
     _iterate_graph_nodes_recursive,
     _get_all_constants,
+    to_array,
 )
 
 if TYPE_CHECKING:
@@ -862,17 +863,13 @@ def remove_quantization_nodes_from_onnx_graph(
             producer = producers[tensor]
 
             if producer.input[1] in constants:
-                scale = onnx.numpy_helper.to_array(
-                    constants[producer.input[1]], base_dir=base_dir
-                )
+                scale = to_array(constants[producer.input[1]], base_dir=base_dir)
             else:
                 raise RuntimeError(
                     f"Cannot find constant with name {producer.input[1]} in onnx model"
                 )
             if producer.input[2] in constants:
-                offset = onnx.numpy_helper.to_array(
-                    constants[producer.input[2]], base_dir=base_dir
-                )
+                offset = to_array(constants[producer.input[2]], base_dir=base_dir)
             else:
                 raise RuntimeError(
                     f"Cannot find constant with name {producer.input[2]} in onnx model"
@@ -884,7 +881,7 @@ def remove_quantization_nodes_from_onnx_graph(
 
                 if consumer.attribute == producer.attribute:
                     if consumer.input[1] in constants:
-                        scale_ = onnx.numpy_helper.to_array(
+                        scale_ = to_array(
                             constants[consumer.input[1]], base_dir=base_dir
                         )
                     else:
@@ -893,7 +890,7 @@ def remove_quantization_nodes_from_onnx_graph(
                         )
 
                     if consumer.input[2] in constants:
-                        offset_ = onnx.numpy_helper.to_array(
+                        offset_ = to_array(
                             constants[consumer.input[2]], base_dir=base_dir
                         )
                     else:
@@ -1063,9 +1060,7 @@ def _get_float_encoding_from_onnx_node(
         meta_scale_name = None
 
     if scale_name in constants:
-        scale = torch.tensor(
-            onnx.numpy_helper.to_array(constants[scale_name], base_dir=base_dir)
-        )
+        scale = torch.tensor(to_array(constants[scale_name], base_dir=base_dir))
     else:
         raise RuntimeError(f"Cannot find constant with name {scale_name} in onnx model")
 
@@ -1089,9 +1084,7 @@ def _get_float_encoding_from_onnx_node(
     if not meta_scale_name:
         return encoding
 
-    meta_scale = torch.tensor(
-        onnx.numpy_helper.to_array(constants[meta_scale_name], base_dir=base_dir)
-    )
+    meta_scale = torch.tensor(to_array(constants[meta_scale_name], base_dir=base_dir))
 
     if not (finfo == _float4_e2m1fn and meta_scale.numel() == 1):
         raise NotImplementedError(
@@ -1137,16 +1130,12 @@ def _get_affine_encoding_from_onnx_node(
             zero_point_shift = attr.f
 
     if scale_name in constants:
-        scale = torch.tensor(
-            onnx.numpy_helper.to_array(constants[scale_name], base_dir=base_dir)
-        )
+        scale = torch.tensor(to_array(constants[scale_name], base_dir=base_dir))
     else:
         raise RuntimeError(f"Cannot find constant with name {scale_name} in onnx model")
 
     if offset_name in constants:
-        offset = torch.tensor(
-            onnx.numpy_helper.to_array(constants[offset_name], base_dir=base_dir)
-        )
+        offset = torch.tensor(to_array(constants[offset_name], base_dir=base_dir))
     else:
         raise RuntimeError(
             f"Cannot find constant with name {offset_name} in onnx model"

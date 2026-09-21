@@ -19,6 +19,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 from aimet_onnx.quantsim import op_outputs_to_ignore
+from aimet_onnx.common.onnx._utils import to_array
 
 logger = logging.getLogger(__name__)
 
@@ -633,7 +634,7 @@ def _convert_lora_scales(
                 const_node = producer_map[inp]
                 for attr in const_node.attribute:
                     if attr.name == "value":
-                        scale_value = float(numpy_helper.to_array(attr.t))
+                        scale_value = float(to_array(attr.t))
                 scale_input = inp
                 constants_to_remove.add(id(const_node))
                 break

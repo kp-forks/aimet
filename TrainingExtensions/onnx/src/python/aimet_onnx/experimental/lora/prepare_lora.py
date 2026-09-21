@@ -29,6 +29,7 @@ from pathlib import Path
 import numpy as np
 import onnx
 from onnx import numpy_helper
+from aimet_onnx.common.onnx._utils import to_array
 
 # Ops whose outputs are not quantized — copied from quantsim.py to avoid
 # pulling in the full quantsim import chain (which requires C++ libs).
@@ -473,7 +474,7 @@ def _find_scale_by_name(
                 # Already a named initializer — read value
                 for init in model.graph.initializer:
                     if init.name == inp:
-                        val = float(numpy_helper.to_array(init))
+                        val = float(to_array(init))
                         return inp, val
                 return inp, None
 
@@ -488,7 +489,7 @@ def _find_scale_by_name(
             if prod is not None and prod.op_type == "Constant":
                 for attr in prod.attribute:
                     if attr.name == "value":
-                        val = float(numpy_helper.to_array(attr.t))
+                        val = float(to_array(attr.t))
                         return inp, val
     return None, None
 
@@ -656,7 +657,7 @@ def _try_match_lora_add(
             scale_input = inp
             for attr in prod.attribute:
                 if attr.name == "value":
-                    scale_value = float(numpy_helper.to_array(attr.t))
+                    scale_value = float(to_array(attr.t))
         elif inp in init_names:
             # Scale could also be an initializer
             scale_input = inp
@@ -821,7 +822,7 @@ def _try_match_conv_adapted_lora_add(
                 scale_input = inp
                 for attr in prod.attribute:
                     if attr.name == "value":
-                        scale_value = float(numpy_helper.to_array(attr.t))
+                        scale_value = float(to_array(attr.t))
             elif inp in init_names:
                 scale_input = inp
             elif (
@@ -949,7 +950,7 @@ def _try_match_lora_add_chained(
                     scale_input = inp
                     for attr in prod.attribute:
                         if attr.name == "value":
-                            scale_value = float(numpy_helper.to_array(attr.t))
+                            scale_value = float(to_array(attr.t))
                 elif inp in init_names:
                     scale_input = inp
                 elif (
@@ -1024,7 +1025,7 @@ def _try_match_lora_add_chained(
             scale_input = inp
             for attr in prod.attribute:
                 if attr.name == "value":
-                    scale_value = float(numpy_helper.to_array(attr.t))
+                    scale_value = float(to_array(attr.t))
         elif inp in init_names:
             scale_input = inp
         elif (
@@ -1353,7 +1354,7 @@ def _split_shared_initializers(
 
     for actual_init_name, group in shared_groups.items():
         source_init = init_map[actual_init_name]
-        source_data = numpy_helper.to_array(source_init)
+        source_data = to_array(source_init)
 
         for pattern in group:
             # Create a new initializer with unique name (use full module_path
@@ -1513,20 +1514,20 @@ def _convert_scale_constants(
             if prod and prod.op_type == "Constant":
                 for attr in prod.attribute:
                     if attr.name == "value":
-                        arr = numpy_helper.to_array(attr.t)
+                        arr = to_array(attr.t)
                         scale_data = arr.astype(np.float32)
                         scale_value = float(arr) if arr.ndim == 0 else arr.tolist()
             elif pattern.scale_input in init_names:
                 for init in model.graph.initializer:
                     if init.name == pattern.scale_input:
-                        arr = numpy_helper.to_array(init)
+                        arr = to_array(init)
                         scale_data = arr.astype(np.float32)
                         scale_value = float(arr) if arr.ndim == 0 else arr.tolist()
                         break
             elif prod and prod.op_type == "Identity" and prod.input[0] in init_names:
                 for init in model.graph.initializer:
                     if init.name == prod.input[0]:
-                        arr = numpy_helper.to_array(init)
+                        arr = to_array(init)
                         scale_data = arr.astype(np.float32)
                         scale_value = float(arr) if arr.ndim == 0 else arr.tolist()
                         break
