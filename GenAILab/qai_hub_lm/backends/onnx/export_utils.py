@@ -4,7 +4,10 @@
 """Utilities for exporting models from ONNX to Torch"""
 
 import contextlib
+import inspect
 import os
+import warnings
+from collections.abc import Sequence
 from pathlib import Path
 import torch
 import onnx
@@ -179,6 +182,105 @@ def _unique_initializer_names():
         GraphInitializers.__setitem__ = original
 
 
+def dynamic_axes_to_dynamic_shapes(
+    input_names: Sequence[str],
+    dynamic_axes: dict[str, dict[int, str]],
+):
+    """Lower a name-keyed ``dynamic_axes`` dict to a ``dynamic_shapes`` spec.
+
+    Models declare dynamism once, as ``dynamic_axes``
+    (``{input_name: {dim_index: symbol}}``). The TorchScript tracer consumes that
+    directly; dynamo wants a spec positionally aligned with the inputs. This is
+    the only place that converts, so the choice of tracer stays orthogonal to how
+    a model declares its axes.
+
+    Every declared axis becomes ``Dim.AUTO``, leaving ``torch.export`` to recover
+    the relationships between axes from the traced guards. That is both less for
+    us to state and more than we *could* state: the public ``Dim`` arithmetic
+    admits only increasing integer-linear derivations, so the relation this
+    codebase actually needs -- attention KV states holding
+    ``context_length - sequence_length`` entries -- cannot be written by hand
+    (``NotImplementedError: Attempted to negate ...``), while declaring the two
+    axes independently is rejected outright as a constraint violation. ``AUTO``
+    infers it correctly.
+
+    Entries for outputs (``logits``) are ignored -- only ``input_names`` matters,
+    and the result is positionally aligned with it.
+    """
+    return tuple(
+        {dim: torch.export.Dim.AUTO for dim in dynamic_axes[name]}
+        if dynamic_axes.get(name)
+        else None
+        for name in input_names
+    )
+
+
+def _match_dynamic_shapes_to_signature(model, dynamic_shapes):
+    """Reshape a per-input ``dynamic_shapes`` tuple to mirror ``forward``'s params.
+
+    ``dynamic_shapes`` is produced one entry per input tensor, but
+    ``torch.export`` matches it against the *pytree of the call args*. A forward
+    declared ``forward(self, *args)`` -- which is how the exportable wrappers here
+    take their flattened inputs -- is a single ``VAR_POSITIONAL`` parameter, so a
+    flat 67-tuple is one level too shallow and export rejects it with
+    "`inputs` has 1 elements, but `dynamic_shapes` has 67 elements".
+
+    Keying by parameter name sidesteps the nesting question: the var-positional
+    parameter collects the remaining specs as a tuple, and ordinary parameters
+    take one each.
+    """
+    if dynamic_shapes is None:
+        return None
+
+    remaining = list(dynamic_shapes)
+    matched: dict[str, object] = {}
+    for param in inspect.signature(model.forward).parameters.values():
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            matched[param.name] = tuple(remaining)
+            remaining = []
+            break
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        if not remaining:
+            break
+        matched[param.name] = remaining.pop(0)
+
+    if remaining:
+        raise ValueError(
+            f"{type(model).__name__}.forward accepts fewer inputs than the "
+            f"{len(dynamic_shapes)} dynamic-shape entries built for it; "
+            f"{len(remaining)} left unmatched."
+        )
+    return matched
+
+
+def _materialize_view_inputs(sample_input):
+    """Replace view tensors among the sample inputs with materialized copies.
+
+    A tensor that is a view of a larger one (``t._base is not None``) makes
+    ``torch.export`` emit a shape guard against the *base's* extent, e.g.::
+
+        Guard failed: args_2.size()[1] < args_2._base.size()[1]
+
+    ``run_decompositions`` then re-traces through AOT autograd with materialized
+    tensors, whose ``_base`` is ``None``, so the generated guard evaluates
+    ``None.size()`` and the export dies with "'NoneType' object has no attribute
+    'size'" -- reported as a failure to decompose the FX graph, which points
+    nowhere near the real cause. Only dynamic-shape exports emit those guards,
+    which is why static export never tripped on it.
+
+    ``Generator.prepare_inputs`` returns views quite legitimately -- for instance
+    ``position_ids`` is a window onto a context-length ``arange`` -- so normalize
+    here, where the export-specific hazard lives, rather than there.
+    """
+    return tuple(
+        tensor.detach().clone()
+        if isinstance(tensor, torch.Tensor) and tensor._base is not None
+        else tensor
+        for tensor in sample_input
+    )
+
+
 def _dynamo_export(
     model,
     sample_input,
@@ -187,14 +289,44 @@ def _dynamo_export(
     input_names,
     output_names,
     opset_version,
+    dynamic_shapes=None,
 ):
-    """Run a dynamo-based ONNX export via draft_export.
+    """Run a dynamo-based ONNX export.
 
-    Uses ``torch.export.draft_export`` to produce an ExportedProgram that
-    tolerates data-dependent branching, then hands it to ``torch.onnx.export``
-    which skips the capture step and goes straight to ONNX translation.
+    Produces an ExportedProgram, then hands it to ``torch.onnx.export`` which
+    skips the capture step and goes straight to ONNX translation.
+
+    Capture prefers ``torch.export.export``, falling back to
+    ``torch.export.draft_export`` (which tolerates data-dependent branching) only
+    if that fails. ``draft_export`` used to be unconditional, but it cannot trace
+    a ``scan`` higher-order op: it makes shapes symbolic that plain export leaves
+    static (head dims included) and then dies with "Dynamo failed to run FX node
+    with fake tensors: call_function scan". Qwen 3.5's linear-attention kernel is
+    built on ``scan``, and plain export handles it -- with or without dynamic
+    shapes -- so try the stricter capture first and keep the tolerant one for the
+    models that need it.
+
+    :param dynamic_shapes: Optional ``torch.export`` dynamic-shape spec,
+        positionally aligned with ``sample_input``.  This is the dynamo-path
+        counterpart of ``dynamic_axes`` (which ``torch.onnx.export`` honours
+        only on the TorchScript path); without it the exported graph is fully
+        static regardless of any ``dynamic_axes`` passed alongside.
     """
-    program = torch.export.draft_export(model, sample_input, strict=False)
+    matched_shapes = _match_dynamic_shapes_to_signature(model, dynamic_shapes)
+    sample_input = _materialize_view_inputs(sample_input)
+    try:
+        program = torch.export.export(
+            model, sample_input, dynamic_shapes=matched_shapes, strict=False
+        )
+    except Exception as exc:  # noqa: BLE001 - fall back to the tolerant capture
+        warnings.warn(
+            f"torch.export.export failed for {type(model).__name__} "
+            f"({type(exc).__name__}: {exc}); retrying with draft_export.",
+            stacklevel=2,
+        )
+        program = torch.export.draft_export(
+            model, sample_input, dynamic_shapes=matched_shapes, strict=False
+        )
 
     with _unique_initializer_names():
         torch.onnx.export(
@@ -299,6 +431,13 @@ def get_onnx_model(
                     input_names=input_names,
                     output_names=output_names,
                     opset_version=ONNX_OPSET_VERSION,
+                    # Same declaration as dynamic_axes below, lowered to the
+                    # form dynamo takes.
+                    dynamic_shapes=(
+                        dynamic_axes_to_dynamic_shapes(input_names, dynamic_axes)
+                        if dynamic_axes
+                        else None
+                    ),
                 )
             else:
                 torch.onnx.export(

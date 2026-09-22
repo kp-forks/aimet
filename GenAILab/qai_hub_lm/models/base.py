@@ -201,6 +201,13 @@ class LLM(ABC):
 
         Marks the sequence_length and kv_cache_length dimensions as dynamic so
         that a single ONNX graph can be used with varying sequence lengths.
+
+        This is the single declaration of *which* dims are dynamic, for both
+        export paths: the TorchScript tracer consumes it as-is, and the dynamo
+        path lowers it to ``dynamic_shapes`` (see
+        ``dynamic_axes_to_dynamic_shapes``). Dims sharing a symbol name are the
+        same dim; the dynamo lowering leaves the relationships between them to
+        torch.export, which recovers them from the traced guards.
         """
         axes: dict[str, dict[int, str]] = {
             "input_ids": {1: "sequence_length"},

@@ -13,19 +13,59 @@ The unified function replaces both:
 
 Within each chunk the math follows QNN-cores' formulation: cumsum via
 lower-triangular matmul, and a product-form Newton refinement for the
-triangular solve (~11 MatMul ONNX ops per chunk). This is compact enough
-that the inter-chunk loop can be unrolled without graph explosion.
+triangular solve (~11 MatMul ONNX ops per chunk).  The intra-chunk math is
+batched across the chunk axis, so it is already sequence-length independent.
+
+Chunk-size handling
+-------------------
+``chunk_size`` is a *cap*, not a fixed width: the chunk extent used is
+``min(seq_len, chunk_size)``, derived inside the graph via ``torch.sym_min`` so
+it stays symbolic.  One exported graph therefore hardens into a prefill graph
+(chunk 64) and a decode graph (chunk 1) by fixing the sequence length alone --
+the same knob already hardened before compilation -- with one set of quantsim
+encodings covering both.
+
+This matters because the intra-chunk triangular solve is pure waste at decode.
+At ``seq_len == 1`` the padded rows are structurally zero and
+``strict_lower_tri`` zeros the diagonal, so ``attn`` is identically zero and
+``(I - A)^-1`` is *exactly* the identity -- at any chunk size.  A fixed
+``chunk_size=64`` decode graph spends 11 matmuls over 64x64 matrices per head
+per layer computing that constant.  Deriving the extent from the sequence length
+collapses them to 1x1: measured on Qwen3.5-0.8B (3 linear-attention layers,
+16 heads, head dim 128), the Scan body drops from 201,326,592 MACs per iteration
+to 2,371,584 -- 85x less work per decoded token.
+
+Do NOT write this as ``chunk = 1 if seq_len == 1 else 64``.  Branching on a
+symbolic shape makes the exporter resolve the guard by *specializing* the
+sequence axis, exactly as documented for ``pad_size`` below.  ``sym_min`` emits a
+symbolic ``Min`` instead, which survives into the ONNX graph and folds away once
+the sequence length is fixed.
+
+The cap must stay <= 64: ``_solve_triangular``'s banded seed plus four
+product-form squarings spans ``A^0..A^15`` against a nilpotent ``A`` with
+``A^chunk == 0``, which is exact for chunk <= 64 and silently inexact beyond it.
 
 Sequence-length handling
 ------------------------
-Export targets a single, fixed sequence length (no dynamic shapes): inputs
-are padded up to a multiple of ``chunk_size`` and the chunk count is a
-compile-time constant, so the inter-chunk loop unrolls cleanly.  Variable
-*real* lengths within a fixed-length graph are carried by ``attention_mask``
-(a data input), which zeros the key/value/decay contributions of padded
-positions.  Without this, left-padded inputs would let padded-token garbage
-pollute the recurrent state; with it, masked positions are inert and results
-match the unmasked variable-length reference to machine precision.
+The inter-chunk recurrence is a ``scan`` (``torch._higher_order_ops.scan``),
+which the dynamo ONNX exporter lowers to a single ONNX ``Scan`` node.  The
+chunk count is therefore the scan's trip count -- a runtime property of the
+scanned input's leading dimension -- not a compile-time constant, so one
+graph serves every sequence length and the graph no longer grows with it.
+
+Any sequence length works, including ones that are not a multiple of
+``chunk_size``: inputs are padded up to a multiple and the result sliced back
+down.  Both operations stay in the graph under a dynamic sequence dim -- do
+not make them conditional on ``pad_size``, since branching on a symbolic
+value makes the exporter specialize the axis to exact multiples and quietly
+reject every other length (``seq_len=1`` decode included).
+
+Variable *real* lengths within a batch are still carried by
+``attention_mask`` (a data input), which zeros the key/value/decay
+contributions of padded positions.  Without this, left-padded inputs would
+let padded-token garbage pollute the recurrent state; with it, masked
+positions are inert and results match the unmasked variable-length reference
+to machine precision.
 """
 
 from __future__ import annotations
@@ -34,6 +74,10 @@ import functools
 
 import torch
 import torch.nn.functional as F
+
+# Private path: ``scan`` has no public alias as of torch 2.11.  Switch to the
+# public name once one exists.
+from torch._higher_order_ops.scan import scan
 from transformers import PreTrainedModel
 
 from GenAILab.bench.yaml_config_parser import YAMLConfigParser
@@ -109,16 +153,24 @@ def exportable_gated_delta_rule(
 ):
     """Unified gated delta rule for both prefill and decode.
 
-    For prefill (seq_len > 1): pads to a multiple of chunk_size, processes
-    each chunk with QNN-cores-style matrix ops in a plain Python loop.
-    For decode (seq_len == 1): pads to one chunk; the matrix ops degenerate
-    to vector ops trivially.
+    For prefill (seq_len > 1): processes each chunk with QNN-cores-style
+    matrix ops, the inter-chunk recurrence carried by a ``scan``.
+    For decode (seq_len == 1): the chunk extent collapses to 1, so the matrix
+    ops degenerate to vector ops and the scan runs one iteration.
+
+    Sequence length may be dynamic, and need not be a multiple of
+    ``chunk_size`` -- see the module docstring.
+
+    :param chunk_size: Upper bound on the chunk extent, not a fixed width. The
+        extent actually used is ``min(seq_len, chunk_size)``, kept symbolic so a
+        single graph serves prefill and decode. Must be <= 64; see the module
+        docstring on the solve's convergence bound.
 
     :param attention_mask: Optional ``[batch, seq_len]`` mask (1 = real token,
         0 = padding).  Padded positions have their key/value/decay zeroed so
         they contribute nothing to the recurrent state or intra-chunk
-        attention.  Required for correctness when inputs are left-padded to a
-        fixed export length.
+        attention.  Required for correctness when inputs are left-padded
+        within a batch of mixed real lengths.
     """
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
@@ -132,6 +184,11 @@ def exportable_gated_delta_rule(
     batch_size, num_heads, seq_len, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
 
+    # Derive the chunk extent from the sequence length: ``chunk_size`` is a cap,
+    # not a fixed width. ``sym_min`` keeps this symbolic -- see the module
+    # docstring for why a ``if seq_len == 1`` branch cannot work here.
+    chunk_size = torch.sym_min(seq_len, chunk_size)
+
     # Zero out padded positions before chunking. Masking key/value/g makes a
     # padded token's contribution to the recurrent state and to intra-chunk
     # attention exactly zero, so a fixed-length (padded) graph matches the
@@ -142,14 +199,24 @@ def exportable_gated_delta_rule(
         value = value * mask.unsqueeze(-1)
         g = g * mask
 
-    # Pad to a multiple of chunk_size
+    # Pad to a multiple of chunk_size. Kept unconditional on purpose: under a
+    # dynamic sequence dim ``pad_size`` is symbolic, and branching on it (``if
+    # pad_size:``) forces the exporter to *specialize* -- it resolves the branch
+    # by constraining the sequence length to exact multiples of chunk_size, which
+    # silently makes the graph reject every other length (decode at seq_len=1
+    # included). An unconditional pad keeps the axis genuinely free at the cost
+    # of a few Pad nodes.
+    # With a derived chunk extent both operands are symbolic (``Mod(S, Min(64,
+    # S))``), which exports fine and keeps every length working: for
+    # ``seq_len <= chunk_size`` the extent equals the length so the pad is zero,
+    # and above it the pad rounds up to the cap as before. No divisibility
+    # requirement is imposed on the sequence length.
     pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
     query = F.pad(query, (0, 0, 0, pad_size))
     key = F.pad(key, (0, 0, 0, pad_size))
     value = F.pad(value, (0, 0, 0, pad_size))
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
-    total_seq_len = seq_len + pad_size
 
     query = query * (k_head_dim**-0.5)
     v_beta = value * beta.unsqueeze(-1)
@@ -161,7 +228,6 @@ def exportable_gated_delta_rule(
         for x in (query, key, value, k_beta, v_beta)
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
-    num_chunks = total_seq_len // chunk_size
 
     # Precompute masks (shared across all chunks)
     tril_mask = torch.tril(
@@ -196,28 +262,30 @@ def exportable_gated_delta_rule(
         else initial_state.to(value)
     )
 
-    # Inter-chunk loop (unrolled — ~15 ops per chunk is small enough)
-    outputs = []
-    for i in range(num_chunks):
-        q_i = query[:, :, i]
-        k_i = key[:, :, i]
-        v_i = value[:, :, i]
-        kc_i = k_cumdecay[:, :, i]
-        dm_i = decay_mask[:, :, i]
-        g_i = g_cum[:, :, i]
+    # Inter-chunk recurrence, as a native scan. ``scan`` iterates dim 0, so the
+    # chunk axis moves to the front; the recurrent state is the carry and the
+    # per-chunk outputs are stacked. Lowers to one ONNX ``Scan`` whose body is
+    # ``_chunk_step``, keeping the graph independent of sequence length.
+    xs = [x.movedim(2, 0) for x in (query, key, value, k_cumdecay, decay_mask, g_cum)]
+
+    def _chunk_step(state, xs_i):
+        q_i, k_i, v_i, kc_i, dm_i, g_i = xs_i
 
         attn_i = (q_i @ k_i.transpose(-1, -2) * dm_i) * tril_mask
         v_new = v_i - kc_i @ state
         o_i = (q_i * g_i.unsqueeze(-1).exp()) @ state + attn_i @ v_new
 
-        state = (
+        next_state = (
             state * g_i[:, :, -1, None, None].exp()
             + (k_i * (g_i[:, :, -1, None] - g_i).exp().unsqueeze(-1)).transpose(-1, -2)
             @ v_new
         )
-        outputs.append(o_i)
+        return next_state, o_i
 
-    core_attn_out = torch.stack(outputs, dim=2)
+    state, core_attn_out = scan(_chunk_step, state, xs)
+    core_attn_out = core_attn_out.movedim(
+        0, 2
+    )  # [n_chunks, B, H, C, Dv] -> [B, H, ...]
 
     if not output_final_state:
         state = None
@@ -237,14 +305,24 @@ def exportable_gated_delta_rule(
 def _roll_indices(npad, seq_len, device):
     """Gather indices that roll a [..., seq_len] tensor left by ``npad`` columns.
 
-    ``npad`` is a per-batch int64 tensor of shape ``(B,)``. Implemented as a
-    modular index so it exports to a single ONNX ``GatherElements`` (no Loop /
-    data-dependent control flow), unlike ``torch.roll`` with a tensor shift.
+    ``npad`` is a per-batch int64 tensor of shape ``(B,)``. Implemented as an
+    index arithmetic expression so it exports to a single ONNX
+    ``GatherElements`` (no Loop / data-dependent control flow), unlike
+    ``torch.roll`` with a tensor shift.
+
+    The wrap-around is a conditional subtraction rather than ``% seq_len``: with
+    a dynamic sequence dim the divisor is symbolic, and ONNX's
+    ``aten_remainder_scalar`` translation calls ``int()`` on it, failing with
+    "int() argument must be ... not 'SymbolicTensor'".  Since ``base`` is at most
+    ``seq_len - 1`` and ``npad`` at most ``seq_len``, the sum is always below
+    ``2 * seq_len``, so subtracting ``seq_len`` once where it overflows is
+    exactly equivalent to the modulo.
     """
     import torch
 
     base = torch.arange(seq_len, device=device).unsqueeze(0)  # (1, S)
-    return (base + npad.unsqueeze(1)) % seq_len  # (B, S)
+    idx = base + npad.unsqueeze(1)  # (B, S), < 2 * seq_len
+    return torch.where(idx < seq_len, idx, idx - seq_len)
 
 
 def exportable_gated_delta_net_forward(
@@ -421,22 +499,37 @@ def _passthrough_recurrent_attn_mask(
     return attention_mask
 
 
+#: Largest chunk extent ``_solve_triangular`` inverts exactly. Its banded seed
+#: plus four product-form squarings spans ``A^0..A^15`` against a nilpotent ``A``
+#: with ``A^chunk == 0``; beyond this the solve degrades silently, so the cap is
+#: enforced rather than documented.
+MAX_CHUNK_SIZE = 64
+
+
 def _patch_gated_delta_net_instances(
     model: PreTrainedModel, chunk_size: int = 64
 ) -> None:
     """Walk all modules and replace the gated delta rule + forward on GatedDeltaNet instances."""
     import types
 
+    if not 1 <= chunk_size <= MAX_CHUNK_SIZE:
+        raise ValueError(
+            f"chunk_size must be in [1, {MAX_CHUNK_SIZE}], got {chunk_size}. It "
+            "caps the chunk extent; above the cap the triangular solve stops "
+            "being exact (see the module docstring)."
+        )
+
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
     for module in model.modules():
         if isinstance(module, Qwen3_5GatedDeltaNet):
-            module.chunk_gated_delta_rule = functools.partial(
-                exportable_gated_delta_rule, chunk_size=chunk_size
-            )
-            module.recurrent_gated_delta_rule = functools.partial(
-                exportable_gated_delta_rule, chunk_size=1
-            )
+            # One cap serves both entry points: the extent is derived as
+            # ``min(seq_len, chunk_size)``, so the recurrent path no longer
+            # needs its own hardcoded chunk_size=1 -- a seq_len=1 call reaches
+            # the same extent through the same graph.
+            rule = functools.partial(exportable_gated_delta_rule, chunk_size=chunk_size)
+            module.chunk_gated_delta_rule = rule
+            module.recurrent_gated_delta_rule = rule
             module.forward = types.MethodType(
                 exportable_gated_delta_net_forward, module
             )
@@ -482,8 +575,11 @@ class Qwen3_5ExportableLinearAttentionAdaptation:
     explosion.
 
     Configurable via YAML adaptation kwargs:
-        chunk_size (int): Prefill chunk size for the triangular solve.
-            Defaults to 64.
+        chunk_size (int): Upper bound on the chunk extent for the triangular
+            solve, not a fixed width -- the extent used is
+            ``min(seq_len, chunk_size)``, so one exported graph hardens into
+            prefill and decode graphs by fixing the sequence length alone.
+            Defaults to 64, which is also the maximum (``MAX_CHUNK_SIZE``).
     """
 
     chunk_size = 64
@@ -493,3 +589,272 @@ class Qwen3_5ExportableLinearAttentionAdaptation:
         model = super().instantiate_model(*args, **kwargs)
         _patch_gated_delta_net_instances(model, chunk_size=cls.chunk_size)
         return model
+
+
+# ---------------------------------------------------------------------------
+# Hardening-time graph passes (specification -- not implemented here)
+# ---------------------------------------------------------------------------
+#
+# "Hardening" is the step that turns the one exported graph into a compilable
+# artifact by fixing its symbolic sequence length: prefill at e.g. 128, decode
+# at 1. Because the chunk extent is derived as ``min(seq_len, chunk_size)``,
+# fixing the sequence length also fixes the chunk extent, and a great deal of
+# the graph becomes provably dead in the decode specialization specifically.
+#
+# None of this can be done in the kernel. Removing the dead work requires
+# knowing the sequence length, and branching on it inside the graph would
+# specialize the axis and destroy the single-graph property (see the module
+# docstring). So the removal has to happen *after* hardening, per
+# specialization. That does not weaken the single-graph paradigm: both
+# specializations still come from one export and one set of quantsim encodings.
+#
+# Two global constraints apply to every pass below.
+#
+#   * Run them AFTER quantsim export. They delete and rewrite nodes; running
+#     them earlier changes the tensor names the encodings are keyed on. Deleted
+#     tensors leave orphaned entries in the encodings file, which is harmless
+#     for name-keyed lookup -- prune them only if some tool validates that every
+#     entry maps to a live tensor.
+#   * The rewritten region must be UNQUANTIZED. A QDQ pair or QcQuantizeOp
+#     sitting on a chain stops constant propagation dead, so the
+#     ``op_outputs_to_ignore`` extension for the mask-construction ops
+#     (``Range``, ``Equal``, ``GreaterOrEqual``, ``Min``, ``Not``, ``And``,
+#     ``Cast``) is a precondition for passes 1-3, not a cosmetic cleanup.
+#
+# Node counts quoted below were measured on Qwen/Qwen3.5-0.8B truncated to 4
+# layers (3 ``linear_attention`` + 1 ``full_attention``), CL=4096, vocab
+# shrunk to 4096 so a hardened copy fits under protobuf's 2GB ceiling. They
+# are structural measurements: op counts and shapes, not numerics.
+#
+# ===========================================================================
+# Pass 0 -- Harden the symbolic dims                            PREREQUISITE
+# ===========================================================================
+#
+# Everything else depends on this producing genuinely static shapes.
+#
+# A name-matching substitution is NOT sufficient. ``make_dim_param_fixed(graph,
+# "s50", 128)`` rewrites only dims whose ``dim_param`` is literally ``"s50"``.
+# The chunk extent appears as the *derived* string ``Min(64, s50)``, and the
+# KV-cache length as ``4096 - s50`` -- which these exports already carry on the
+# graph boundary today, so whatever hardens the sequence length must already
+# cope with derived expressions. After a name-only substitution the Scan body
+# still reads ``Min(64, s50)`` and nothing downstream is static.
+#
+# What works, in order:
+#
+#   1. For every boundary ``dim_param``, EVALUATE the expression with the
+#      sequence symbol bound (handles ``4096 - s50`` and ``Min(64, s50)``
+#      alike) and write the result as a ``dim_value``.
+#   2. Strip stale symbolic shape metadata RECURSIVELY, including each
+#      subgraph's own ``input``/``output`` declarations -- not just
+#      ``value_info``. A Scan body carries the chunk extent on its own
+#      boundary, and no amount of outer-graph substitution reaches it.
+#      Clearing ``value_info`` alone leaves ``Min(64, s50)`` in place.
+#   3. Re-run shape inference, then constant-fold (pass 1).
+#
+# Note that ONNX ``shape_inference`` alone does not re-derive Scan-body dims
+# (it leaves ``unk__NN``); ORT's optimiser does, and yields fully static
+# shapes. Verify by asserting that no ``dim_param`` survives anywhere in the
+# graph, subgraphs included.
+#
+# ===========================================================================
+# Pass 1 -- Constant-fold                                       PREREQUISITE
+# ===========================================================================
+#
+# Ordinary constant folding, which ``ORT_ENABLE_BASIC`` already performs. It
+# collapses the shape-derived mask construction: ``Min``, ``Range``, ``Trilu``
+# and ``Equal`` all disappear, and ``tril_mask``, ``eye`` and
+# ``strict_lower_tri`` become literal initializers. Measured: 625 -> 582 nodes
+# (prefill), 625 -> 571 (decode).
+#
+# Do NOT use ``ORT_ENABLE_EXTENDED`` or ``ORT_ENABLE_ALL`` to produce a
+# deployment artifact. They rewrite 6 Scan-body MatMuls into ``FusedMatMul``
+# in the ``com.microsoft`` domain -- ORT-specific ops a non-ORT backend cannot
+# consume. They remove no arithmetic (the MAC count is unchanged; the ops are
+# absorbed Transposes), so the only thing they buy here is a trap.
+#
+# ===========================================================================
+# Pass 2 -- Collapse the dead intra-chunk solve                 DECODE ONLY
+# ===========================================================================
+#
+# The largest node-count win, and the one nothing off-the-shelf does.
+#
+# WHY IT IS DEAD. At chunk extent 1, ``strict_lower_tri = tril(1,1) - eye(1)``
+# is the 1x1 zero matrix, so ``attn = -((k_beta @ key.T) * decay_mask) *
+# strict_lower_tri`` is identically zero whatever the data. ``_solve_triangular``
+# then evaluates, exactly:
+#
+#     M_mat = I - 0 = I        acc = I + 0 = I       power = 0, 0 @ 0 = 0
+#     M0    = mask_acc * I = I  E0 = I - I @ I = 0   E1 = E2 = E3 = 0
+#     return  I @ (I+0) @ (I+0) @ (I+0) @ (I+0)  =  I
+#
+# Eleven matmuls to produce the identity, plus the two that consume it
+# (``value = inv @ v_beta`` and ``k_cumdecay = inv @ (...)``). Thirteen matmuls
+# and ~14 elementwise ops per layer computing nothing, for 44 MACs of real
+# arithmetic -- roughly 39 of the 77 top-level MatMuls in the decode graph.
+#
+# WHY FOLDING CANNOT DO IT. Folding evaluates nodes whose inputs are all
+# constant. ``attn``'s other operands are data, so ``Mul(data, [[0.0]])`` is
+# not foldable and the folder correctly stops there. Confirmed: every one of
+# these matmuls survives ``ORT_ENABLE_ALL``.
+#
+# THE REWRITE. Two algebraic identities, which hold regardless of the unknown
+# operand's value:
+#
+#     (a)  Mul(x, 0)     -> 0
+#     (b)  MatMul(I, x)  -> x
+#
+# Only (a) needs the insight. Once it fires, ``attn`` is a constant and
+# ORDINARY CONSTANT FOLDING CASCADES THROUGH THE WHOLE SOLVE unaided --
+# ``I - 0``, ``I + 0``, ``0 @ 0``, the Taylor loop, all four squarings, the
+# product chain -- until the solve's output is the literal identity. (b) then
+# removes the two matmuls that consume it, which folding cannot touch because
+# ``v_beta`` is data. So the pass is: apply (a), re-fold, apply (b), re-fold.
+#
+# HOW TO FIND IT. After pass 1 the decode graph contains an all-zero 1x1
+# initializer feeding one ``Mul`` per linear-attention layer, each of whose
+# output feeds ``[MatMul, MatMul, MatMul, Add, Sub]`` -- the entry to the
+# Newton chain. In the reference export those were ``sub_143`` (value
+# ``[[0.0]]``) feeding ``mul_886``, ``mul_1635`` and ``mul_2384``. Do not match
+# on names, which are export-order dependent: scan for ``Mul`` nodes with an
+# all-zero constant input. The prefill graph has no such initializer -- at
+# extent 64 the mask is a real strictly-lower-triangular matrix -- which is
+# why this pass is decode-only and must be safe to run as a no-op on prefill.
+#
+# For (b), verify the constant really is an identity matrix before rewriting,
+# and check the batch dims broadcast compatibly. At extent 1 it is the 1x1
+# ``[[1.0]]``, i.e. a scalar multiply by one.
+#
+# SOUNDNESS. ``0 * x = 0`` is FALSE in IEEE-754 when x is Inf or NaN
+# (``0 * Inf = NaN``). This is a fast-math rewrite, and that is very likely why
+# ORT declines to do it in general. It is sound here for a specific reason:
+# quantization makes finiteness a graph invariant, because every activation on
+# this path carries an encoding that clamps it to a finite range, so Inf/NaN
+# cannot reach the Mul. State that precondition explicitly in the pass -- it is
+# the difference between a sound local rewrite and a footgun someone later
+# points at a float graph.
+#
+# OPTIONAL EXTENSION. ``Sub(x, x) -> 0`` additionally collapses ``decay_mask``,
+# which at extent 1 is ``exp(g_cum - g_cum) * 1 = 1``, removing two more Muls
+# in the Scan body. It requires recognising the *same tensor* on both inputs
+# (both are unsqueezes of ``g_cum``), and carries the same NaN caveat.
+#
+# ===========================================================================
+# Pass 3 -- Drop zero-width Pad                                 DECODE ONLY
+# ===========================================================================
+#
+# At extent ``min(S, chunk_size)`` the pad is zero whenever ``S <= chunk_size``,
+# so at decode all 15 ``Pad`` nodes are no-ops with literal zero pad amounts.
+# They survive ``ORT_ENABLE_ALL`` unchanged.
+#
+# Rewrite: a ``Pad`` whose ``pads`` input is a constant of all zeros becomes
+# ``Identity`` and is removed. Guard on the pads being *constant* -- in the
+# prefill specialization they are non-zero, and pre-hardening they are computed.
+#
+# ===========================================================================
+# Pass 4 -- Drop full-extent Slice                              DECODE ONLY
+# ===========================================================================
+#
+# The kernel's closing ``core_attn_out[:, :, :seq_len]`` undoes the pad. When
+# the pad was zero the slice spans the whole axis and is a no-op. ORT's
+# EXTENDED level removes some (22 -> 12) but leaves others, and EXTENDED is
+# unusable for deployment (pass 1).
+#
+# Rewrite: a ``Slice`` whose ``starts``/``ends``/``steps`` are constants
+# covering the full extent of a now-static axis becomes ``Identity``. This
+# needs pass 0 to have made the axis static -- against a symbolic dim the
+# comparison cannot be made.
+#
+# ===========================================================================
+# Pass 5 -- Inline a trip-count-1 Scan                          DECODE ONLY
+# ===========================================================================
+#
+# Plausibly the biggest *real* win, and certainly the one least likely to come
+# for free from a backend.
+#
+# At decode there is exactly one chunk, so each of the three ``Scan`` nodes
+# runs a single iteration. The loop machinery is then pure overhead: the carry
+# is marshalled in and out for one pass, and the subgraph boundary blocks
+# fusion between the body and the surrounding graph. ``Scan=3`` survives every
+# ORT level.
+#
+# Rewrite: when a ``Scan``'s scan axis has static extent 1, splice the body into
+# the parent graph -- squeeze the scanned inputs along the scan axis, wire them
+# to the body's inputs, rename body nodes to avoid collisions, unsqueeze the
+# scan outputs back, and connect the final carry directly. Assert the extent is
+# 1 rather than assuming it; at prefill it is ``S / chunk_size``.
+#
+# This is worth doing regardless of whether QNN supports Scan well: if support
+# is weak it is a correctness/performance necessity, and if it is good it still
+# removes a fusion barrier. It is also the pass most likely to be reusable
+# outside this model.
+#
+# ===========================================================================
+# Appendix A -- The conv roll is NOT a graph rewrite
+# ===========================================================================
+#
+# ``exportable_gated_delta_net_forward`` rolls the real tokens to the front so
+# the cached ``conv_state`` sits adjacent to them, and rolls the outputs back:
+# 10 ``GatherElements`` plus index arithmetic across the linear layers. At
+# decode ``npad = 1 - n_real`` is always 0, because the single token being
+# decoded is real by construction -- so both rolls are the identity.
+#
+# But ``npad`` is derived from the attention mask, i.e. from DATA. No folder can
+# prove it, and no algebraic identity applies. Removing these requires
+# *asserting* "at seq_len == 1 the query token is always real", which narrows
+# the graph's contract rather than simplifying its algebra. Keep it in a
+# separate category from passes 2-5, and if it is ever done, make the assertion
+# explicit and checkable at runtime rather than silent.
+#
+# ===========================================================================
+# Appendix B -- Measured baseline (what to expect, and what ORT will not do)
+# ===========================================================================
+#
+#   hardened, both specializations : 625 nodes
+#       {Scan:3, MatMul:80, Pad:15, Slice:22, Min:1, Range:4, Trilu:2, Equal:1}
+#
+#   after pass 1 (ORT BASIC):
+#       prefill : 582 nodes  Scan body 72 nodes, 15 MatMul, 201,326,592 MACs/iter
+#       decode  : 571 nodes  Scan body 69 nodes, 15 MatMul,   2,371,584 MACs/iter
+#
+# The 85x MAC ratio is the payoff of the derived chunk extent itself, already
+# realised. The Scan body's 15 MatMuls are 5 per layer -- the genuine
+# recurrence (``q@k.T``, ``attn@v_new``, ``kc@state``, ``q'@state``,
+# ``k.T@v_new``) -- so the ARITHMETIC is essentially at its floor and passes
+# 2-5 buy node count, not MACs. The dead solve is intra-chunk and therefore
+# lives in the TOP-LEVEL graph, not the Scan body; that is where pass 2 acts.
+#
+# Whether ~80 fewer nodes matters is a dispatch-overhead question that only an
+# on-target profile answers. Profile before building passes 2-4. Also check
+# first whether QAIRT's own folding already implements ``Mul(x, 0) -> 0``: it
+# does constant folding and some algebraic simplification, and if that rule is
+# in there, pass 2 comes free.
+#
+# ===========================================================================
+# Appendix C -- Ordering, verification, and where this code belongs
+# ===========================================================================
+#
+# Order: 0 (harden) -> 1 (fold) -> 2 (solve) -> 1 -> 3, 4 (no-op Pad/Slice)
+# -> 5 (inline Scan) -> 1. Re-fold after 2 and 5, since both expose new
+# constant regions.
+#
+# Verification, per pass: run the graph in ORT at that specialization's
+# sequence length before and after, on the same inputs, and require bitwise or
+# near-bitwise agreement (these are all supposed to be semantics-preserving at
+# that shape). Then assert the structural property the pass claims -- no
+# ``dim_param`` anywhere after 0, no all-zero-mask ``Mul`` after 2, no
+# zero-width ``Pad`` after 3, no ``Scan`` after 5. A pass that changes numerics
+# is a bug, not a tradeoff.
+#
+# These passes do NOT belong in this file when implemented. This module is a
+# model transform that runs before export; the passes operate on a hardened
+# ONNX artifact after quantsim export. They belong in the export/deploy layer
+# -- alongside whatever performs pass 0 today -- and each needs its own tests
+# on a small fixture graph. They are specified here only because this is where
+# the reasoning about *why* they are safe lives.
+#
+# Not graph passes, but the other half of the decode story, recorded in
+# ``exportable_linear_attention_dynamic_chunk.md``: merging the two ``@ state``
+# matmuls (which read the same state and are memory-bound GEMVs at decode) into
+# one, and hardening an extra AR-N specialization for speculative decode, where
+# ``min(S, chunk_size) == S`` gives one chunk and amortises the state traffic.

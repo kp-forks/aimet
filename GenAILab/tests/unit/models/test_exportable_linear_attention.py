@@ -234,3 +234,294 @@ class TestExportableGatedDeltaRule:
         # Reference: the full sequence at once, take the last token.
         ref_full = _reference(q, k, v, g, beta)
         assert _max_err(out_decode[:, 0], ref_full[:, CHUNK]) < TOL
+
+
+class TestOnnxScanExport:
+    """The inter-chunk recurrence must export to a single ONNX ``Scan``.
+
+    Qwen 3.5 is the reference model for aimet-onnx's Loop/Scan subgraph
+    support, so both the presence of the subgraph and the shape of the graph
+    around it are part of the contract.
+    """
+
+    class _Wrapper(torch.nn.Module):
+        def forward(self, query, key, value, g, beta, state):
+            return exportable_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                chunk_size=CHUNK,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+    @staticmethod
+    def _export(tmp_path):
+        """Export with a dynamic seq dim, the way the backend declares it."""
+        onnx = pytest.importorskip("onnx")
+        q, k, v, g, beta = _rand_inputs(1, 2 * CHUNK, seed=7)
+        state = torch.zeros(1, N_HEADS, K_DIM, V_DIM)
+        seq_axis = {0: None, 1: torch.export.Dim.AUTO}
+        path = str(tmp_path / "scan.onnx")
+        torch.onnx.export(
+            TestOnnxScanExport._Wrapper().eval(),
+            (q, k, v, g, beta, state),
+            path,
+            dynamo=True,
+            dynamic_shapes=(seq_axis, seq_axis, seq_axis, seq_axis, seq_axis, None),
+            opset_version=18,
+        )
+        return onnx.load(path), path
+
+    def test_emits_single_scan_node(self, tmp_path):
+        model, _ = self._export(tmp_path)
+        op_types = [n.op_type for n in model.graph.node]
+        assert op_types.count("Scan") == 1, op_types
+        # No unrolled copies of the body left at the top level.
+        assert op_types.count("Loop") == 0
+
+    def test_padding_stays_in_the_graph(self, tmp_path):
+        """The pad must survive export, or the seq axis gets specialized.
+
+        Branching on the symbolic ``pad_size`` (``if pad_size:``) makes the
+        exporter resolve the branch by constraining the sequence length to exact
+        multiples of ``chunk_size``, which silently breaks every other length --
+        decode at ``seq_len=1`` included. Keeping Pad in the graph is what keeps
+        the axis free, so its absence is the bug, not an optimization.
+        """
+        model, _ = self._export(tmp_path)
+        assert "Pad" in [n.op_type for n in model.graph.node]
+
+    def test_accepts_lengths_that_are_not_whole_chunks(self, tmp_path):
+        """A ragged length and a single decode token must both run."""
+        ort = pytest.importorskip("onnxruntime")
+        import numpy as np
+
+        _, path = self._export(tmp_path)
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        names = [i.name for i in sess.get_inputs()]
+
+        for seq in (1, CHUNK + 1, 100):
+            q, k, v, g, beta = _rand_inputs(1, seq, seed=13)
+            state = torch.zeros(1, N_HEADS, K_DIM, V_DIM)
+            ref, _ = exportable_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                chunk_size=CHUNK,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            feeds = dict(zip(names, [x.numpy() for x in (q, k, v, g, beta, state)]))
+            out, _ = sess.run(None, feeds)
+            assert out.shape == ref.shape, f"seq={seq}"
+            assert np.abs(out - ref.numpy()).max() < 1e-4, f"seq={seq}"
+
+    def test_graph_size_is_sequence_length_independent(self, tmp_path):
+        """Guards against the body silently unrolling back into the top level."""
+        model, _ = self._export(tmp_path)
+        top_level = len(model.graph.node)
+        scan = next(n for n in model.graph.node if n.op_type == "Scan")
+        body = next(a.g for a in scan.attribute if a.name == "body")
+        # Generous bounds: these catch an unroll regression, not op-count drift.
+        assert top_level < 120, f"top-level grew to {top_level} nodes"
+        assert len(body.node) < 60, f"scan body grew to {len(body.node)} nodes"
+        # The recurrent state is the scan carry: first body input, first output.
+        assert len(body.input) >= 1 and len(body.output) >= 2
+
+    def test_one_graph_serves_multiple_sequence_lengths(self, tmp_path):
+        """A single exported graph must run at lengths it was not traced at."""
+        ort = pytest.importorskip("onnxruntime")
+        import numpy as np
+
+        _, path = self._export(tmp_path)
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        names = [i.name for i in sess.get_inputs()]
+
+        for seq in (CHUNK, 3 * CHUNK):
+            q, k, v, g, beta = _rand_inputs(1, seq, seed=11)
+            state = torch.zeros(1, N_HEADS, K_DIM, V_DIM)
+            ref_out, ref_state = exportable_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                chunk_size=CHUNK,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            feeds = dict(zip(names, [x.numpy() for x in (q, k, v, g, beta, state)]))
+            out, out_state = sess.run(None, feeds)
+            assert np.abs(out - ref_out.numpy()).max() < 1e-4
+            assert np.abs(out_state - ref_state.numpy()).max() < 1e-4
+
+
+class TestDerivedChunkExtent:
+    """``chunk_size`` is a cap; the extent used is ``min(seq_len, chunk_size)``.
+
+    This is what lets one exported graph harden into a prefill graph and a
+    decode graph by fixing the sequence length alone, with one set of encodings
+    covering both. The properties that make that safe are tested here.
+    """
+
+    def test_decode_matches_an_explicit_chunk_size_of_one(self):
+        """A seq_len=1 call under the cap must equal the recurrent form exactly.
+
+        Not merely close: the derivation picks extent 1, so it runs the same
+        arithmetic. Any drift means the extent was not derived.
+        """
+        q, k, v, g, beta = _rand_inputs(1, 1, seed=3)
+        state = torch.randn(1, N_HEADS, K_DIM, V_DIM)
+        capped = exportable_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            chunk_size=CHUNK,
+            initial_state=state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        explicit = exportable_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            chunk_size=1,
+            initial_state=state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert _max_err(capped[0], explicit[0]) == 0.0
+        assert _max_err(capped[1], explicit[1]) == 0.0
+
+    def test_solve_is_the_identity_at_decode(self):
+        """At seq_len=1 the intra-chunk solve is dead work, at any chunk size.
+
+        The padded rows are structurally zero and ``strict_lower_tri`` zeros the
+        diagonal, so ``attn`` is identically zero and ``(I - A)^-1`` is exactly
+        ``I``. Deriving the extent shrinks those matmuls from chunk x chunk to
+        1 x 1 -- the whole point of the derivation, so it is worth pinning.
+        """
+        import GenAILab.qai_hub_lm.transforms.exportable_linear_attention as ela
+
+        seen = []
+        original = ela._solve_triangular
+
+        def spy(attn, chunk_size, order=4):
+            out = original(attn, chunk_size, order)
+            seen.append(
+                (
+                    tuple(attn.shape),
+                    attn.abs().max().item(),
+                    (out - torch.eye(attn.shape[-1])).abs().max().item(),
+                )
+            )
+            return out
+
+        ela._solve_triangular = spy
+        try:
+            q, k, v, g, beta = _rand_inputs(1, 1, seed=4)
+            exportable_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                chunk_size=CHUNK,
+                initial_state=torch.randn(1, N_HEADS, K_DIM, V_DIM),
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+        finally:
+            ela._solve_triangular = original
+
+        ((shape, attn_absmax, dev_from_identity),) = seen
+        assert shape[-2:] == (1, 1), f"extent was not derived: solve got {shape}"
+        assert attn_absmax == 0.0
+        assert dev_from_identity == 0.0
+
+    def test_prefill_is_unchanged_by_the_cap(self):
+        """For seq_len >= chunk_size the extent is the cap, so parity holds."""
+        q, k, v, g, beta = _rand_inputs(1, 2 * CHUNK, seed=5)
+        out, _ = exportable_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            chunk_size=CHUNK,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert _max_err(out, _reference(q, k, v, g, beta)) < TOL
+
+    @pytest.mark.parametrize("seq", [1, 3, CHUNK - 1, CHUNK, CHUNK + 1, 2 * CHUNK])
+    def test_no_divisibility_requirement(self, seq):
+        """Every length works: the pad handles ``seq > cap``, and below the cap
+        the extent equals the length so no pad is needed at all."""
+        q, k, v, g, beta = _rand_inputs(1, seq, seed=seq)
+        out, state = exportable_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            chunk_size=CHUNK,
+            initial_state=torch.zeros(1, N_HEADS, K_DIM, V_DIM),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert out.shape == (1, seq, N_HEADS, V_DIM)
+        assert torch.isfinite(out).all() and torch.isfinite(state).all()
+
+    def test_cap_above_the_solve_bound_is_rejected(self):
+        """The solve is only exact up to ``MAX_CHUNK_SIZE``; fail loudly."""
+        from GenAILab.qai_hub_lm.transforms.exportable_linear_attention import (
+            MAX_CHUNK_SIZE,
+            _patch_gated_delta_net_instances,
+        )
+
+        with pytest.raises(ValueError, match="chunk_size must be in"):
+            _patch_gated_delta_net_instances(
+                torch.nn.Module(), chunk_size=MAX_CHUNK_SIZE + 1
+            )
+
+    def test_one_graph_hardens_to_prefill_and_decode(self, tmp_path):
+        """The deployment property: one exported graph, two sequence lengths,
+        including the decode length it was not traced at."""
+        ort = pytest.importorskip("onnxruntime")
+        import numpy as np
+
+        _, path = TestOnnxScanExport._export(tmp_path)
+        sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        names = [i.name for i in sess.get_inputs()]
+
+        for seq in (2 * CHUNK, 1):
+            q, k, v, g, beta = _rand_inputs(1, seq, seed=13)
+            state = torch.zeros(1, N_HEADS, K_DIM, V_DIM)
+            ref_out, ref_state = exportable_gated_delta_rule(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                chunk_size=CHUNK,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            feeds = dict(zip(names, [x.numpy() for x in (q, k, v, g, beta, state)]))
+            out, out_state = sess.run(None, feeds)
+            assert np.abs(out - ref_out.numpy()).max() < TOL, f"seq={seq}"
+            assert np.abs(out_state - ref_state.numpy()).max() < TOL, f"seq={seq}"
