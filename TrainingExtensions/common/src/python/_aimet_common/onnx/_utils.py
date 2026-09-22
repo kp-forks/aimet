@@ -538,11 +538,12 @@ def _dequantize_const(
     block_size: Optional[int],
     output_dtype: str,
     per_block_int_scale: Optional[np.ndarray],
+    base_dir: str = "",
 ) -> TensorProto:
     if output_dtype == "bfloat16":
         raise RuntimeError("Unsupported data type: {}")
 
-    const_q = to_array(const_q)
+    const_q = to_array(const_q, base_dir=base_dir)
     # Always dequantize in float32
     y_scale = y_scale.astype(np.float32)
 
@@ -1148,6 +1149,7 @@ def _convert_version(
 
 def _remove_onnx_qdq_nodes(
     model: onnx.ModelProto,
+    base_dir: str = "",
 ) -> List[Dict[str, Union[str, int, np.ndarray]]]:
     initializers: Dict[str, TensorProto] = {
         init.name: init for init in model.graph.initializer
@@ -1263,6 +1265,7 @@ def _remove_onnx_qdq_nodes(
                     block_size=e.get("block_size"),
                     output_dtype="float32",
                     per_block_int_scale=e.get("per_block_int_scale"),
+                    base_dir=base_dir,
                 )
 
             continue

@@ -322,7 +322,7 @@ def test_fp_model():
 @pytest.mark.parametrize(
     "device", ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
 )
-def test_compute_missing_encodings(device: str):
+def test_compute_missing_encodings(device: str, tmp_path: Path):
     """
     Given: Model with functional ops
     When: Export with aimet_torch.export.export and compute missing encodings
@@ -372,6 +372,16 @@ def test_compute_missing_encodings(device: str):
                 assert quantized_dtype == expected_dtype, (
                     f"{node.name} has quantized dtype {quantized_dtype}, expected {expected_dtype}"
                 )
+
+    # Should be exportable to ONNX
+    aimet_torch.onnx.export(
+        ep.module(),
+        example_inputs,
+        str(tmp_path / "model.onnx"),
+        dynamo=True,
+        external_data=True,
+        opset_version=21,
+    )
 
 
 @pytest.mark.parametrize(

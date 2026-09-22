@@ -1125,7 +1125,7 @@ def _to_onnx(
         is_param = name in param_names or aliases.get(name) in param_names
         tensor_to_encoding_map[name] = (encoding, is_param)
 
-    for encoding in _remove_onnx_qdq_nodes(onnx_model):
+    for encoding in _remove_onnx_qdq_nodes(onnx_model, base_dir=base_dir):
         name = encoding.pop("name")
         is_param = name in param_names or aliases.get(name) in param_names
         encoding = AffineEncoding._from_qnn_encoding_dict(encoding, version="2.1.0")
