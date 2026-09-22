@@ -29,6 +29,7 @@ do_sync() {
     --exclude='.git' \
     --exclude='build' \
     --exclude='__pycache__' \
+    --exclude='onnx_checkpoints' \
     --exclude='*.pyc' \
     --exclude='.venv' \
     --exclude='GenAILab/artifacts' \
