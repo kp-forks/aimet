@@ -122,17 +122,17 @@ export PATH="$HOME/.local/bin:$PATH"
 echo "Setting up Python $PYTHON_VERSION venv at $VENV_DIR..."
 uv venv "$VENV_DIR" --python "$PYTHON_VERSION" --seed
 . "$VENV_DIR/bin/activate"
-pip install --upgrade pip wheel setuptools
+uv pip install --upgrade pip wheel setuptools
 
 # -----------------------------------------------------------------------
 # Python dependencies
 # -----------------------------------------------------------------------
 echo "Installing PyTorch with CUDA support..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 echo "Installing Python dependencies..."
-pip install qai_hub_models
-pip install -r "$REPO_DIR/GenAILab/requirements.txt"
+uv pip install qai_hub_models
+uv pip install -r "$REPO_DIR/GenAILab/requirements.txt"
 
 # -----------------------------------------------------------------------
 # AIMET
@@ -154,10 +154,10 @@ else
       # Remove this cap once the pod driver is upgraded to r580+.
       ORT_PIN="onnxruntime-gpu<=1.26"
     fi
-    pip install "$WHEELS_DIR"/*.whl $ORT_PIN
+    uv pip install "$WHEELS_DIR"/*.whl $ORT_PIN
   else
     echo "No pre-built wheels found. Installing from PyPI (for dependencies)..."
-    pip install aimet-torch aimet-onnx
+    uv pip install aimet-torch aimet-onnx
   fi
 fi
 
