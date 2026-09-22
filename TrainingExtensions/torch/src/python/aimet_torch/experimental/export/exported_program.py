@@ -196,15 +196,14 @@ class ExportedProgram(torch.export.ExportedProgram):
             ):
                 continue
 
-            tensor_meta = node.meta.get("tensor_meta", None)
             val = node.meta.get("val", None)
 
             # Exclude non-tensors from quantization
-            if tensor_meta is None or not isinstance(val, torch.Tensor):
+            if not isinstance(val, torch.Tensor):
                 continue
 
             # Exclude non-floating point tensors from quantization
-            if not tensor_meta.dtype.is_floating_point:
+            if not val.dtype.is_floating_point:
                 continue
 
             if node.name in newly_added_qtzrs:

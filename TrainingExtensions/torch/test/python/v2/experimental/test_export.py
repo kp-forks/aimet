@@ -333,6 +333,13 @@ def test_compute_missing_encodings(device: str, tmp_path: Path):
     example_inputs = (torch.randn(1, 3, 224, 224, device=device),)
     fold_all_batch_norms(model, None, dummy_input=example_inputs)
     ep = aimet_torch.experimental.export.export(model, example_inputs)
+
+    # Save and load for robustness. Legacy meta data such as "tensor_meta" are
+    # intentionally dropped during torch.export.save. Serializing and deserializing here
+    # helps ensure AIMET doesn't rely on the meta data that are dropped during serialization.
+    torch.export.save(ep, tmp_path / "model.pt2")
+    ep = torch.export.load(tmp_path / "model.pt2")
+
     ep = AimetExportedProgram.from_torch_exported_program(ep)
 
     with ep.compute_missing_encodings(param_bw=8, activation_bw=16):
@@ -526,7 +533,7 @@ def test_compute_missing_encodings_with_constant():
     )
     assert (
         mul_node.all_input_nodes[1].target
-        != torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        == torch.ops.quantized_decomposed.dequantize_per_tensor.default
     )
     assert len(mul_node.users) == 1
     assert (
@@ -539,7 +546,7 @@ def test_compute_missing_encodings_with_constant():
     )
     assert (
         add_node.all_input_nodes[1].target
-        != torch.ops.quantized_decomposed.dequantize_per_tensor.default
+        == torch.ops.quantized_decomposed.dequantize_per_tensor.default
     )
     assert len(add_node.users) == 1
     assert (
