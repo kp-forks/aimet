@@ -18,7 +18,11 @@ from aimet_torch.quantization.encoding_analyzer import (
     _flag_extreme_min_max,
 )
 from aimet_torch.quantization.base import QuantizerBase
-from aimet_torch.quantization.float.encoding import FloatEncoding, _NVFP4Encoding
+from aimet_torch.quantization.float.encoding import (
+    FloatEncoding,
+    _MXFP4Encoding,
+    _NVFP4Encoding,
+)
 from aimet_torch.quantization.tensor import DequantizedTensor
 from aimet_torch.utils import (
     StatisticsNotFoundError,
@@ -315,11 +319,6 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
 
     def get_scale(self) -> torch.Tensor:
         log2_scale = self._get_log2_scale()
-
-        if self._finfo == _float4_e2m1fn and type(self) != _NVFP4QuantizeDequantize:
-            # For float4_e2m1fn, the scale is restricted to powers of 2, so we round the log2_scale to nearest integer
-            log2_scale = torch.round(log2_scale)
-
         return 2**log2_scale
 
     def _get_log2_scale(self) -> torch.Tensor:
@@ -522,6 +521,47 @@ class QuantizeDequantize(FloatQuantizeDequantize):
     """
 
 
+class _MXFP4QuantizeDequantize(FloatQuantizeDequantize):
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        block_size: tuple[int, ...],
+    ):
+        super().__init__(
+            *_float4_e2m1fn,
+            shape=shape,
+            block_size=block_size,
+        )
+
+    def _get_log2_scale(self) -> torch.Tensor:
+        # MXFP4 scale is restricted to powers of 2, so we round the log2_scale to nearest integer
+        return torch.round(super()._get_log2_scale())
+
+    def get_encodings(self) -> Optional[_MXFP4Encoding]:
+        if self.is_initialized():
+            return _MXFP4Encoding(
+                self.get_scale(),
+                block_size=self.block_size,
+                producer=self,
+            )
+        return None
+
+    @classmethod
+    def from_encodings(cls, encodings: _MXFP4Encoding) -> "_MXFP4QuantizeDequantize":
+        if not isinstance(encodings, _MXFP4Encoding):
+            raise TypeError(f"Expected {_MXFP4Encoding}; got {type(encodings)}")
+
+        qtzr = _MXFP4QuantizeDequantize(
+            shape=encodings.scale.shape,
+            block_size=encodings.block_size,
+        )
+
+        with torch.no_grad():
+            qtzr.maxval.copy_(encodings.maxval)
+
+        return qtzr
+
+
 class _NVFP4QuantizeDequantize(FloatQuantizeDequantize):
     """
     Temporary placeholder class for exporting NVFP4 encoding to ONNX
@@ -541,20 +581,15 @@ class _NVFP4QuantizeDequantize(FloatQuantizeDequantize):
         )
         self.register_buffer("meta_scale", torch.ones(()))
 
-    def forward(self, input: torch.Tensor):
-        output = super().forward(input)
-
-        if not isinstance(output, DequantizedTensor):
-            return output
-
-        encoding = output.encoding
-        output.encoding = _NVFP4Encoding(
-            encoding.scale,
-            self.meta_scale,
-            encoding.block_size,
-            producer=encoding.producer,
-        )
-        return output
+    def get_encodings(self) -> Optional[_NVFP4Encoding]:
+        if self.is_initialized():
+            return _NVFP4Encoding(
+                self.get_scale(),
+                self.meta_scale,
+                self.block_size,
+                producer=self,
+            )
+        return None
 
     @classmethod
     def from_encodings(cls, encodings: _NVFP4Encoding) -> "_NVFP4QuantizeDequantize":

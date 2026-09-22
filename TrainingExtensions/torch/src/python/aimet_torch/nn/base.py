@@ -29,9 +29,14 @@ from aimet_torch.quantization.affine import (
 )
 from aimet_torch.quantization.float.quantizer import (
     FloatQuantizeDequantize,
+    _MXFP4QuantizeDequantize,
     _NVFP4QuantizeDequantize,
 )
-from aimet_torch.quantization.float.encoding import FloatEncoding, _NVFP4Encoding
+from aimet_torch.quantization.float.encoding import (
+    FloatEncoding,
+    _MXFP4Encoding,
+    _NVFP4Encoding,
+)
 
 from aimet_torch.quantization.tensor import QuantizedTensorBase, DequantizedTensor
 from aimet_torch.quantization.base import QuantizerBase
@@ -828,13 +833,8 @@ class BaseQuantizationMixin(abc.ABC):
             )
             raise RuntimeError(error_str)
 
-        e2m1_qdq = FloatQuantizeDequantize(
-            exponent_bits=2,
-            mantissa_bits=1,
-            finite=True,
-            unsigned_zero=False,
-            shape=quantizer_shape,
-            block_size=block_shape,
+        e2m1_qdq = _MXFP4QuantizeDequantize(
+            shape=quantizer_shape, block_size=block_shape
         )
 
         # 2. Derive e8m0 scales from the weight values
@@ -1171,6 +1171,8 @@ class BaseQuantizationMixin(abc.ABC):
                     target_cls = QuantizeDequantize
                 elif isinstance(qdq_param.encoding, _NVFP4Encoding):
                     target_cls = _NVFP4QuantizeDequantize
+                elif isinstance(qdq_param.encoding, _MXFP4Encoding):
+                    target_cls = _MXFP4QuantizeDequantize
                 elif isinstance(qdq_param.encoding, FloatEncoding):
                     target_cls = FloatQuantizeDequantize
                 else:

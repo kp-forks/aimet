@@ -1030,13 +1030,12 @@ def _get_float_encoding_from_onnx_node(
     base_dir: Optional[str] = None,
 ) -> FloatEncoding:
     # pylint: disable=protected-access
-    from aimet_torch.quantization.float.encoding import FloatEncoding, _NVFP4Encoding
-    from aimet_torch.quantization.float._finfo import (
-        _finfo,
-        _float4_e2m1fn,
-        _float8_e4m3fn,
-        _float8_e5m2fnuz,
+    from aimet_torch.quantization.float.encoding import (
+        FloatEncoding,
+        _MXFP4Encoding,
+        _NVFP4Encoding,
     )
+    from aimet_torch.quantization.float._finfo import _finfo, _float4_e2m1fn
 
     finfo = None
     block_size = None
@@ -1075,6 +1074,11 @@ def _get_float_encoding_from_onnx_node(
         scale=scale,
         block_size=block_size,
     )
+
+    try:
+        encoding = _MXFP4Encoding._from_float_encoding(encoding)
+    except ValueError:
+        pass
 
     input_name = quant_node.input[0]
     if input_name in constants:

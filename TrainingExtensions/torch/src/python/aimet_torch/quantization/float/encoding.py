@@ -252,6 +252,83 @@ class FloatEncoding(EncodingBase):
         )
 
 
+class _MXFP4Encoding(FloatEncoding):
+    """
+    Encoding class for MXFP4Quantizer.
+    """
+
+    def __init__(
+        self,
+        scale: torch.Tensor,
+        block_size: tuple[int, ...] | None = None,
+        *,
+        producer: Optional["FloatQuantizeDequantize"] = None,
+    ):
+        super().__init__(
+            mantissa_bits=_float4_e2m1fn.mantissa_bits,
+            exponent_bits=_float4_e2m1fn.exponent_bits,
+            finite=_float4_e2m1fn.finite,
+            unsigned_zero=_float4_e2m1fn.unsigned_zero,
+            scale=scale,
+            block_size=block_size,
+            producer=producer,
+        )
+
+    @classmethod
+    def _from_float_encoding(cls, encoding: FloatEncoding) -> "_MXFP4Encoding":
+        """
+        Create an MXFP4 encoding from a FloatEncoding
+        """
+        # pylint: disable=protected-access
+        if isinstance(encoding, _MXFP4Encoding):
+            return encoding
+
+        if not isinstance(encoding, FloatEncoding):
+            raise ValueError(
+                "Only FloatEncoding can be converted to MXFP4 encoding; "
+                f"got {type(encoding)}"
+            )
+
+        if encoding.block_size is None:
+            raise ValueError(
+                "Cannot create MXFP4 encoding from a FloatEncoding with no block size"
+            )
+
+        if encoding._finfo != _float4_e2m1fn:
+            raise ValueError(
+                f"Cannot create MXFP4 encoding from {encoding._finfo.to_str()} encoding"
+            )
+
+        mantissa, exponent = torch.frexp(encoding.scale)
+        if not (
+            torch.all(mantissa == 0.5)
+            and -126 <= exponent.amin()
+            and exponent.amax() <= 128
+        ):
+            raise ValueError(
+                "Cannot create MXFP4 encoding from a FloatEncoding with a scale "
+                "that cannot be represented in float8e8m0"
+            )
+
+        return cls(
+            scale=encoding.scale,
+            block_size=encoding.block_size,
+            producer=encoding.producer,
+        )
+
+    def to(self, *args, **kwargs) -> "_MXFP4Encoding":
+        fp_encoding = super().to(*args, **kwargs)
+
+        if fp_encoding is self:
+            return self
+
+        return _MXFP4Encoding(
+            scale=fp_encoding.scale,
+            block_size=fp_encoding.block_size,
+            producer=fp_encoding.producer,
+        )
+
+
 class _NVFP4Encoding(FloatEncoding):
     """
     Encoding object for NVidia FP4 quantization

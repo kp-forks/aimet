@@ -34,7 +34,11 @@ from aimet_torch.v2.quantization.affine import (
     QuantizeDequantize,
     GroupedBlockQuantizeDequantize,
 )
-from aimet_torch.quantization.float.encoding import FloatEncoding, _NVFP4Encoding
+from aimet_torch.quantization.float.encoding import (
+    FloatEncoding,
+    _MXFP4Encoding,
+    _NVFP4Encoding,
+)
 from aimet_torch.quantization.float.quantizer import (
     _float_quantize_dequantize,
     _float4_e2m1fn,
@@ -2786,18 +2790,31 @@ def encoding(request):
             scale=torch.ones(64, 4),
             block_size=(1, 16),
         )
+    elif encoding_type == _MXFP4Encoding:
+        return _MXFP4Encoding(
+            scale=torch.ones(64, 4),
+            block_size=(1, 16),
+        )
     elif encoding_type == _NVFP4Encoding:
         return _NVFP4Encoding(
             scale=torch.ones(64, 4),
             meta_scale=torch.tensor(0.1),
             block_size=(1, 16),
         )
+    else:
+        raise ValueError(f"Unsupported encoding type: {encoding_type}")
 
 
 @pytest.mark.cuda
 @pytest.mark.parametrize(
     "encoding",
-    [AffineEncoding, GroupedBlockEncoding, FloatEncoding, _NVFP4Encoding],
+    [
+        AffineEncoding,
+        GroupedBlockEncoding,
+        FloatEncoding,
+        _MXFP4Encoding,
+        _NVFP4Encoding,
+    ],
     indirect=True,
 )
 def test_cross_device_copy_with_prequantized_parameter(encoding: EncodingBase):
@@ -2841,7 +2858,7 @@ def test_cross_device_copy_with_prequantized_parameter(encoding: EncodingBase):
             assert new_encoding.block_grouping == old_encoding.block_grouping
             assert new_encoding.decompressed_bw == old_encoding.decompressed_bw
 
-        if isinstance(new_encoding, FloatEncoding):
+        if isinstance(new_encoding, (FloatEncoding, _MXFP4Encoding)):
             assert new_encoding.mantissa_bits == old_encoding.mantissa_bits
             assert new_encoding.exponent_bits == old_encoding.exponent_bits
             assert new_encoding.finite == old_encoding.finite
