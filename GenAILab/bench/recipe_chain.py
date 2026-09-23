@@ -36,6 +36,7 @@ def apply_quantization_chain(
     component="backbone",
     recipe_cache=None,
     pre_sim=None,
+    topology=None,
 ):
     """Apply a chain of on-sim recipe steps, with automatic cache lookup and save.
 
@@ -47,6 +48,10 @@ def apply_quantization_chain(
     rotated the float model before the sim was built). It is folded into the
     cache base hash so the chain distinguishes rotated from non-rotated graphs;
     pre-sim steps are applied by ``apply_pre_quantization_chain``, not here.
+
+    ``topology`` is the decoder-stack analysis of the float model (ONNX only,
+    ``None`` for torch). It is passed to every step; techniques that do not need
+    it absorb it via ``**kwargs``.
     """
     skip_to = 0
     cached_step_stats = []
@@ -116,6 +121,7 @@ def apply_quantization_chain(
                 generator,
                 train_dataset,
                 component=component,
+                topology=topology,
                 **recipe_kwargs,
             )
         step_stats.append(
@@ -150,6 +156,7 @@ def apply_pre_quantization_chain(
     float_model,
     profiler_kwargs=None,
     profiler_capture_intermediate_data=False,
+    topology=None,
 ):
     """Apply the pre-sim technique chain on the float model, before the sim is built.
 
@@ -157,6 +164,11 @@ def apply_pre_quantization_chain(
     technique acts on the whole float model, so it is applied exactly ONCE here
     (no component axis). ``float_model`` is the backend float bundle (nn.Module
     for torch; the entry with backbone/visual/embedding for onnx).
+
+    ``topology`` is the decoder-stack analysis of ``float_model`` (ONNX only,
+    ``None`` for torch), threaded the same way as in
+    :func:`apply_quantization_chain`. It is passed to every step; techniques that
+    do not need it absorb it via ``**kwargs``.
 
     Returns ``{technique_name: profiler_or_None}`` so the runner can re-attach
     pre-sim work to the recorded recipe for reporting.
@@ -171,9 +183,9 @@ def apply_pre_quantization_chain(
                 **profiler_kwargs,
                 capture_intermediate_data=profiler_capture_intermediate_data,
             ) as profiler:
-                technique_cls.apply(float_model, **kwargs)
+                technique_cls.apply(float_model, topology=topology, **kwargs)
             profilers[name] = profiler
         else:
-            technique_cls.apply(float_model, **kwargs)
+            technique_cls.apply(float_model, topology=topology, **kwargs)
             profilers[name] = None
     return profilers

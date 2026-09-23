@@ -18,7 +18,6 @@ from aimet_onnx.experimental.adascale.adascale_optimizer import (
     adascale_model_config_dict,
 )
 from aimet_onnx.experimental.spinquant import apply_spinquant
-from aimet_onnx.experimental.llm_topology import analyze_llm_topology
 
 from GenAILab.bench.yaml_config_parser import YAMLConfigParser
 from GenAILab.qai_hub_lm.schema import (
@@ -53,10 +52,19 @@ class SpinQuant(PreQuantizationTechnique):
     """Rotate the float ONNX graph (R1/R2/R3) before the sim is built."""
 
     @staticmethod
-    def apply(float_model, *, enable_r1=True, enable_r2=False, enable_r3=False):
+    def apply(
+        float_model,
+        *,
+        enable_r1=True,
+        enable_r2=False,
+        enable_r3=False,
+        topology=None,
+        **kwargs,
+    ):
         embedding = float_model.embedding
         # Where the rotations go comes from llm_topology, which owns model analysis;
-        # SpinQuant only rotates the structure it reports.
+        # SpinQuant only rotates the structure it reports. The topology is analyzed
+        # once by the runner on this same (still unrotated) float model.
         apply_spinquant(
             float_model.backbone,
             visual_model=float_model.visual,
@@ -64,7 +72,7 @@ class SpinQuant(PreQuantizationTechnique):
             enable_r1=enable_r1,
             enable_r2=enable_r2,
             enable_r3=enable_r3,
-            topology=analyze_llm_topology(float_model.backbone),
+            topology=topology,
         )
 
 
@@ -312,6 +320,7 @@ class AdaScale(QuantizationTechnique):
         dataloader: DataLoader,
         num_batches: int = 32,
         num_iterations: int = 64,
+        topology=None,
         **kwargs,
     ):
         # Step 1: Collect calibration inputs in FP mode.
@@ -324,10 +333,16 @@ class AdaScale(QuantizationTechnique):
         # Step 3: Optimize quantization parameters using AdaScale. The decoder-stack
         # structure comes from llm_topology, which owns model analysis; AdaScale
         # only consumes the block boundaries it reports.
+        #
+        # ``topology`` was analyzed once by the runner on the float model. A
+        # preceding SpinQuant step leaves those boundary names intact (it inserts
+        # new tensors and rewires consumers, never renames existing ones), so the
+        # same object stays valid here; apply_adascale re-validates every boundary
+        # name against the live graph before optimizing.
         apply_adascale(
             quantsim,
             inputs,
             adascale_model_config_dict[generator.config.model_type],
             num_iterations,
-            topology=analyze_llm_topology(quantsim.model.model),
+            topology=topology,
         )

@@ -43,6 +43,10 @@ _RECIPE_APPLY_FIXTURES = {
     "generator",
     "dataloader",
     "component",
+    # Decoder-stack analysis of the float model, derived once by the runner and
+    # handed to every on-sim step. A fixture, not a knob: it describes the model,
+    # so it is never something a YAML recipe sets.
+    "topology",
     # pre-sim technique fixture (the float-model bundle)
     "float_model",
 }

@@ -2173,6 +2173,94 @@ class TestTopologyArgument:
         self._assert_unrotated(model, init_before)
 
 
+class TestTopologySurvivesRotation:
+    """A topology analyzed before SpinQuant stays usable by a later technique.
+
+    A caller that analyzes the float model once and then runs SpinQuant followed by
+    another topology consumer (AdaScale, in the GenAI Lab weekly recipes) hands the
+    *pre-rotation* topology to that second consumer. That is only sound because
+    SpinQuant never renames an existing tensor: it inserts new values and rewires
+    consumers, and norm fusion resets gamma rather than removing it.
+
+    These tests pin that property, since the alternative — a silently stale
+    topology — surfaces far downstream as an opaque onnxruntime failure. The block
+    boundaries matter most: they are the whole of what AdaScale reads from a
+    topology, and what it slices the graph on.
+    """
+
+    @staticmethod
+    def _boundary_names(topology: LlmTopology) -> list:
+        """Every residual-stream boundary name, flattened in block order."""
+        return [
+            name
+            for block in topology.blocks
+            for name in (block.residual_input, block.residual_output)
+        ]
+
+    @staticmethod
+    def _value_names(model: onnx.ModelProto) -> set:
+        """Every value name present in ``model``'s graph."""
+        ir_model = onnx_ir.from_proto(model)
+        return set(onnx_ir.convenience.create_value_mapping(ir_model.graph))
+
+    @pytest.mark.parametrize(
+        "rotations",
+        [
+            pytest.param({"enable_r1": True}, id="r1"),
+            pytest.param({"enable_r1": False, "enable_r3": True}, id="r3"),
+            pytest.param({"enable_r1": True, "enable_r3": True}, id="r1_r3"),
+        ],
+    )
+    def test_block_boundaries_survive_rotation(self, rotations):
+        """Every pre-rotation block boundary still names a tensor after rotating.
+
+        Purpose: this is the invariant that lets one up-front analysis serve both
+            SpinQuant and a later AdaScale. R1 fuses gammas and may splice an online
+            Hadamard; R3 inserts MatMuls on the Q and K paths. None of that may
+            rename a residual-stream boundary.
+        Pass criteria: the boundary names read off the topology before
+            ``apply_spinquant`` are all still present in the rotated graph.
+        """
+        torch.manual_seed(0)
+        model = _export_decoder_with_pkv(LlamaStyleDecoder())
+        topology = analyze_llm_topology(model)
+        boundaries = self._boundary_names(topology)
+        assert boundaries and all(name is not None for name in boundaries)
+
+        apply_spinquant(model, topology=topology, **rotations)
+
+        # Pass: the rotated graph still carries every boundary tensor, so the
+        # pre-rotation topology remains a valid description of where the blocks are.
+        missing = sorted(set(boundaries) - self._value_names(model))
+        assert not missing, f"rotation renamed boundary tensor(s): {missing}"
+
+    def test_adascale_accepts_pre_rotation_topology(self):
+        """AdaScale's own boundary validation passes on a pre-rotation topology.
+
+        Purpose: asserting the names survive is only half the claim — what matters
+            is that the consumer accepts them. This drives AdaScale's actual
+            validation (the check that raises "not present in the model being
+            optimized") against a rotated graph, rather than re-implementing it.
+        Pass criteria: no error from the boundary validation after rotation.
+        """
+        from aimet_onnx.experimental.adascale.adascale_optimizer import (
+            _block_boundaries_from_topology,
+            _validate_boundaries_in_graph,
+        )
+
+        torch.manual_seed(0)
+        model = _export_decoder_with_pkv(LlamaStyleDecoder())
+        topology = analyze_llm_topology(model)
+
+        apply_spinquant(model, topology=topology, enable_r1=True, enable_r3=True)
+
+        # Pass: AdaScale can still resolve every block it would optimize.
+        rotated_ir = onnx_ir.from_proto(model)
+        _validate_boundaries_in_graph(
+            rotated_ir.graph, _block_boundaries_from_topology(topology)
+        )
+
+
 class TestNoConnectedGraphDependency:
     """SpinQuant and llm_topology analyze and rewrite the graph on ``onnx_ir`` alone.
 

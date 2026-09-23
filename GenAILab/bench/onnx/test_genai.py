@@ -13,6 +13,7 @@ from pathlib import Path
 from transformers.processing_utils import ProcessorMixin
 
 from aimet_onnx.quantsim import load_encodings_to_sim
+from aimet_onnx.experimental.llm_topology import analyze_llm_topology
 
 from GenAILab.bench.yaml_config_parser import YAMLConfigParser
 from GenAILab.bench.profiler import (
@@ -124,6 +125,18 @@ def test_llm_quantization(
         **model_kwargs,
     )
 
+    # Analyze the decoder-stack structure ONCE, here: on the float model, before
+    # any pre-sim rotation and before the sim is built. A topology describes the
+    # model, not the sim, so every technique that needs it (SpinQuant, AdaScale)
+    # is handed this one object rather than re-deriving its own. It stays a local
+    # threaded through the two chains, so nothing has to own or cache it.
+    #
+    # Note this analysis requires every node to be named. A sim would have filled
+    # in missing names, but a raw export has not been through that, so a graph
+    # from an exporter that leaves nodes unnamed raises here with a clear message
+    # instead of failing opaquely later.
+    topology = analyze_llm_topology(entry.backbone)
+
     # Apply the pre-sim chain generically (name -> registered
     # PreQuantizationTechnique -> apply(float_model, **flags)); the onnx float
     # model is the exported ``entry`` bundle (backbone/visual/embedding), which
@@ -134,6 +147,7 @@ def test_llm_quantization(
         entry,
         profiler_kwargs=config.profiler.gpu_meter_kwargs,
         profiler_capture_intermediate_data=config.profiler.capture_intermediate_data,
+        topology=topology,
     )
 
     sim_collection = model_cls.instantiate_quantsim(
@@ -226,11 +240,18 @@ def test_llm_quantization(
             component="backbone",
             recipe_cache=recipe_cache,
             pre_sim=config.recipe.pre_sim,
+            topology=topology,
         )
 
     # One chain per modality encoder. Each runs with the backbone's quantizers
     # disabled and the generator rewired to yield that component's encoder
     # inputs from prefill().
+    #
+    # No ``topology`` here on purpose: the analysis describes the decoder stack in
+    # the backbone graph, and an encoder is a different graph whose tensor names it
+    # does not name. Leaving it None means a decoder-stack technique in a component
+    # chain falls back to its own internal discovery rather than silently
+    # optimizing against boundaries from the wrong graph.
     component_steps: dict[str, list] = {}
     for _component in sim_collection.present_components():
         _chain = config.recipe.component(_component)

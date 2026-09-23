@@ -49,7 +49,11 @@ class SpinQuant(PreQuantizationTechnique):
     """Rotate the float model (R1/R2) before the sim is built."""
 
     @staticmethod
-    def apply(float_model, *, enable_r1=True, enable_r2=False, enable_r3=False):
+    def apply(
+        float_model, *, enable_r1=True, enable_r2=False, enable_r3=False, **kwargs
+    ):
+        # ``**kwargs`` absorbs the chain's framework-agnostic fixtures (e.g. the
+        # ONNX-only ``topology``); torch SpinQuant discovers structure itself.
         apply_spinquant_pre_sim(
             float_model,
             {
