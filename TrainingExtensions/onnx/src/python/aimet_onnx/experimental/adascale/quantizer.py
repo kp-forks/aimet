@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 # pylint: disable=import-error
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import math
 
 import torch
@@ -524,15 +524,32 @@ class QuantizedConv2d(torch.nn.Conv2d):
 
 
 def add_qlinear_layers(
-    model: torch.nn.Module, bitwidth: int = 4, block_size=None, zero_point_shift=None
+    model: torch.nn.Module,
+    bitwidth: int = 4,
+    block_size=None,
+    zero_point_shift=None,
+    per_module_bitwidth: Optional[Dict[str, int]] = None,
 ) -> torch.nn.Module:
-    def _convert_to_qmodule(module: torch.nn.Module):
+    """
+    :param per_module_bitwidth: Optional mapping of dotted module name (as seen via
+        ``model.named_modules()``) to a bitwidth override. If passed, every
+        Linear/Conv2d module MUST have an entry here -- a missing entry raises
+        ``KeyError`` rather than silently falling back to ``bitwidth``. If not
+        passed (``None``), every Linear/Conv2d uses the flat ``bitwidth`` arg.
+    """
+
+    def _module_bitwidth(name: str) -> int:
+        if per_module_bitwidth is None:
+            return bitwidth
+        return per_module_bitwidth[name]
+
+    def _convert_to_qmodule(module: torch.nn.Module, name: str = ""):
         if isinstance(module, torch.nn.Linear):
             enc_shape = (module.weight.shape[0], 1)
             qmodule = QuantizedLinear(
                 module,
                 enc_shape=enc_shape,
-                bitwidth=bitwidth,
+                bitwidth=_module_bitwidth(name),
                 block_size=block_size,
                 zero_point_shift=zero_point_shift,
             )
@@ -543,14 +560,15 @@ def add_qlinear_layers(
             qmodule = QuantizedConv2d(
                 module,
                 enc_shape=enc_shape,
-                bitwidth=bitwidth,
+                bitwidth=_module_bitwidth(name),
                 block_size=block_size,
                 zero_point_shift=zero_point_shift,
             )
             return qmodule
 
-        for name, child in module.named_children():
-            setattr(module, name, _convert_to_qmodule(child))
+        for child_name, child in module.named_children():
+            full_name = f"{name}.{child_name}" if name else child_name
+            setattr(module, child_name, _convert_to_qmodule(child, full_name))
         return module
 
     model = _convert_to_qmodule(model)

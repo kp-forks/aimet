@@ -205,7 +205,6 @@ class AdaScale:
     default QuantizeDequantize.
     """
 
-    ADASCALE_PARAM_BW = 4  # TODO remove this temporary solution
     # pylint: disable=unused-argument, unused-variable
 
     @classmethod
@@ -493,8 +492,14 @@ class AdaScale:
 
                 out.requires_grad_(False)
                 fp_out.append(change_tensor_device_placement(out, torch.device("cpu")))
+        per_module_bitwidth = {
+            name: quantizer_dict[onnx_name].bitwidth
+            for name, onnx_name in pt_weights_to_onnx_initializers.items()
+            if onnx_name in quantizer_dict
+        }
         pytorch_block = add_qlinear_layers(
-            pytorch_block, bitwidth=AdaScale.ADASCALE_PARAM_BW
+            pytorch_block,
+            per_module_bitwidth=per_module_bitwidth,
         )
         replace_with_adascale_quantizers(pytorch_block)
 

@@ -363,11 +363,12 @@ def copy_pt_encodings_to_sim(
                     "Encodings of the onnx quantizer and adascale quantizer have different lengths"
                 )
 
+            expected_bw = module.param_quantizers["weight"].bitwidth
             for i, encoding in enumerate(enc):
                 delta, offset = calculate_delta_offset(
                     min_val=new_min[i],
                     max_val=new_max[i],
-                    bitwidth=module.param_quantizers["weight"].bitwidth,
+                    bitwidth=expected_bw,
                     use_symmetric_encodings=True,
                     use_strict_symmetric=False,
                 )
@@ -376,5 +377,10 @@ def copy_pt_encodings_to_sim(
                 encoding.offset = offset.item()
                 encoding.min = new_min[i].item()
                 encoding.max = new_max[i].item()
+                # Catches bitwidth-override regressions before they silently corrupt delta/offset.
+                assert encoding.bw == expected_bw, (
+                    f"Encoding bitwidth mismatch for {onnx_param_name}: "
+                    f"encoding.bw={encoding.bw} but AdaScale QDQ bitwidth={expected_bw}"
+                )
             quantizer_dict[onnx_param_name].load_encodings(enc)
             quantizer_dict[onnx_param_name].freeze_encodings()

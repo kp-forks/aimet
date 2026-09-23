@@ -756,6 +756,60 @@ class TestAdascaleQuantizer:
                 assert consolidated_delta_updated_enc != consolidated_delta_orig_enc
 
     @pytest.mark.parallel
+    def test_block_level_api_respects_per_quantizer_bitwidth(self):
+        """optimize_adascale_block must honor each weight quantizer's own bitwidth
+        (e.g. an int8 override on an otherwise int4 sim) rather than forcing every
+        Linear in the block to a single hardcoded bitwidth."""
+        model = ModelWithConsecutiveLinearBlocks().eval()
+        input_shape = (1, 3, 32, 64)
+        torch.random.manual_seed(1)
+        dummy_input = [torch.rand(input_shape), torch.rand(input_shape)]
+        qt_input = [t * 0.3 for t in dummy_input]
+        boosted_weight_name = "onnx::MatMul_24"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            torch.onnx.export(
+                model,
+                dummy_input[0],
+                tempdir + "/model.onnx",
+                input_names=["input"],
+                output_names=["output"],
+                dynamo=False,
+            )
+            model_onnx = load_model(tempdir + "/model.onnx")
+            sim = QuantizationSimModel(
+                model_onnx,
+                [dummy_input],
+                config_file="htp_v73",
+                default_param_bw=4,
+            )
+            sim.qc_quantize_op_dict[boosted_weight_name].set_bitwidth(8)
+            sim._compute_param_encodings(overwrite=False)
+
+            block_input_output_names = (["input"], ["/blocks.0/layer2/Add_output_0"])
+            sim_model = onnx_ir.from_proto(sim.model.model)
+            onnx_ir.passes.common.TopologicalSortPass().call(sim_model)
+            AdaScale.optimize_adascale_block(
+                sim_model,
+                sim.qc_quantize_op_dict,
+                dummy_input,
+                qt_input,
+                block_input_output_names=block_input_output_names,
+                beta_gamma_lr=1e-3,
+                scales_lr=5e-4,
+                num_iterations=5,
+            )
+            sim.model.model.CopyFrom(onnx_ir.to_proto(sim_model))
+
+            boosted_enc = sim.qc_quantize_op_dict[boosted_weight_name].get_encodings()
+            other_enc = sim.qc_quantize_op_dict["onnx::MatMul_25"].get_encodings()
+
+            assert all(e.bw == 8 for e in boosted_enc)
+            assert all(e.bw == 4 for e in other_enc)
+            # int8 symmetric offset is -128, not the int4 default of -8
+            assert all(e.offset == -128 for e in boosted_enc)
+
+    @pytest.mark.parallel
     @pytest.mark.parametrize("seq_len", [8, 32, 2048])
     def test_mse_loss_fn(self, seq_len):
         """lp_loss equals MSE scaled by the sequence length S (dim 1)."""
