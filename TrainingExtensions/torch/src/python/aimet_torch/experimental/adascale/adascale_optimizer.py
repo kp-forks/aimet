@@ -622,22 +622,22 @@ class AdaScale:
                     if curr_iteration > num_iterations:
                         pbar.close()
                         break
-                    with (
-                        torch.set_grad_enabled(True),
+                    with torch.set_grad_enabled(True):
                         # Tolerate in-place cache updates (e.g. linear-attention
-                        # recurrent state) on tensors saved for backward.
-                        torch.autograd.graph.allow_mutation_on_saved_tensors(),
-                    ):
-                        quant_out = run_forward(args, kwargs)
+                        # recurrent state) on tensors saved for backward. Keeping off
+                        # optimizer.step() from the scope.
+                        with torch.autograd.graph.allow_mutation_on_saved_tensors():
+                            quant_out = run_forward(args, kwargs)
 
-                        del args, kwargs
+                            del args, kwargs
 
-                        batch_fp_out = change_tensor_and_cache_device_placement(
-                            deepcopy(fp_out[batch_idx]), device
-                        )
+                            batch_fp_out = change_tensor_and_cache_device_placement(
+                                deepcopy(fp_out[batch_idx]), device
+                            )
 
-                        loss = loss_fn(batch_fp_out, quant_out, batch_idx)
-                        loss.backward()
+                            loss = loss_fn(batch_fp_out, quant_out, batch_idx)
+                            loss.backward()
+
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad()
