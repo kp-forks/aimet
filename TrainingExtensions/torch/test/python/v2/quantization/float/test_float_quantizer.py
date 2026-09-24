@@ -544,3 +544,38 @@ def test_fullgraph_compile(shape, block_size, device):
 def clear_torch_compile_cache():
     yield
     torch.compiler.reset()
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", *(["cuda"] if torch.cuda.is_available() else [])]
+)
+def test_empty_input(device):
+    """
+    When: Run forward with empty input tensor before calibration
+    Then: Should return dequantized tensor normally
+    """
+    x = torch.tensor([], dtype=torch.float32, device=device)
+    qdq = FloatQuantizeDequantize(dtype=torch.float8_e4m3fn, shape=()).to(device)
+
+    y = qdq(x)
+    assert torch.equal(x, y)
+    assert isinstance(y, DequantizedTensor)
+
+    """
+    When: Run calibration with empty input tensor
+    Then: Should finish calibration without error and leave maxval unchanged
+    """
+    maxval_before = qdq.maxval.clone()
+    with qdq.compute_encodings():
+        y = qdq(x)
+    assert torch.equal(qdq.maxval, maxval_before)
+    assert torch.equal(x, y)
+    assert isinstance(y, DequantizedTensor)
+
+    """
+    When: Run forward with empty input tensor after calibration with empty input
+    Then: Should return dequantized tensor normally
+    """
+    y = qdq(x)
+    assert torch.equal(x, y)
+    assert isinstance(y, DequantizedTensor)

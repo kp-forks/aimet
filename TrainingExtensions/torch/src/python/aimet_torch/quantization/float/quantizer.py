@@ -317,6 +317,22 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
             )
         return None
 
+    def _get_dummy_encoding(self) -> FloatEncoding:
+        """
+        Return a dummy encoding for empty input tensors (trivial case)
+        """
+        scale = torch.ones((), dtype=torch.float32, device=self.maxval.device)
+
+        return FloatEncoding(
+            self._finfo.mantissa_bits,
+            self._finfo.exponent_bits,
+            self._finfo.finite,
+            self._finfo.unsigned_zero,
+            scale,
+            block_size=None,
+            producer=self,
+        )
+
     def get_scale(self) -> torch.Tensor:
         log2_scale = self._get_log2_scale()
         return 2**log2_scale
@@ -370,6 +386,10 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
             ):
                 input = input.as_subclass(torch.Tensor)
 
+            # Don't observe empty inputs
+            if input.numel() == 0:
+                return original_forward(input)
+
             batch_statistics = self.encoding_analyzer.update_stats(input)
             num_steps = math.pow(2, self.bitwidth) - 1
             dynamic_min, dynamic_max = (
@@ -419,15 +439,17 @@ class FloatQuantizeDequantize(QuantizerBase):  # pylint: disable=abstract-method
             return input
 
         self._assert_supported_dtype()
-
-        if not self.is_initialized():
-            raise RuntimeError(
-                "Failed to run FloatQuantizeDequantize since quantization parameters are not initialized."
-                " Please initialize the quantization parameters using `compute_encodings()`."
-            )
-
         encoding = self.get_encodings()
-        assert encoding is not None
+
+        if encoding is None:
+            if input.numel() == 0:
+                # Edge case: If input is an empty tensor, use arbitrary encoding
+                encoding = self._get_dummy_encoding()
+            else:
+                raise RuntimeError(
+                    "Failed to run FloatQuantizeDequantize since quantization parameters are not initialized."
+                    " Please initialize the quantization parameters using `compute_encodings()`."
+                )
 
         if (
             not _torch_compiler_is_exporting()

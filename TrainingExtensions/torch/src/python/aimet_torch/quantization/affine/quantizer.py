@@ -441,10 +441,10 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
         """
         Return the quantizer's encodings as an AffineEncoding object
         """
-        if self.is_initialized():
-            scale = self.get_scale(dtype=torch.float32)
-            offset = self._get_offset(scale=scale, dtype=torch.float32)
+        scale = self.get_scale(dtype=torch.float32)
+        offset = self._get_offset(scale=scale, dtype=torch.float32)
 
+        if scale is not None and offset is not None:
             return AffineEncoding(
                 scale,
                 offset,
@@ -619,6 +619,10 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
                 and type(input) != torch.Tensor
             ):
                 input = input.as_subclass(torch.Tensor)
+
+            # Don't observe empty inputs
+            if input.numel() == 0:
+                return original_forward(input)
 
             batch_statistics = self.encoding_analyzer.update_stats(input)
             num_steps = self.qmax - self.qmin
@@ -812,6 +816,25 @@ class AffineQuantizerBase(QuantizerBase, _GridMixin):  # pylint: disable=too-man
         ):
             yield
 
+    def _get_dummy_encoding(self) -> AffineEncoding:
+        """
+        Return a dummy encoding for empty input tensors (trivial case)
+        """
+        device = next(p.device for p in self.parameters())
+        scale = torch.ones((), dtype=torch.float32, device=device)
+        offset = torch.zeros((), dtype=torch.float32, device=device)
+
+        return AffineEncoding(
+            scale,
+            offset,
+            self.qmin,
+            self.qmax,
+            self._symmetric,
+            block_size=None,
+            zero_point_shift=self.zero_point_shift,
+            producer=self,
+        )
+
 
 def _get_symmetric_offset(qmin, qmax, shape, dtype, device):
     return torch.full(
@@ -999,13 +1022,17 @@ class Quantize(AffineQuantizerBase):
             Quantized output
 
         """
-        if not self.is_initialized():
-            raise RuntimeError(
-                "Failed to run Quantize since quantization parameters are not initialized."
-                " Please initialize the quantization parameters using `compute_encodings()`."
-            )
-
         encoding = self.get_encodings()
+
+        if encoding is None:
+            if input.numel() == 0:
+                # Edge case: If input is an empty tensor, use arbitrary encoding
+                encoding = self._get_dummy_encoding()
+            else:
+                raise RuntimeError(
+                    "Failed to run Quantize since quantization parameters are not initialized."
+                    " Please initialize the quantization parameters using `compute_encodings()`."
+                )
 
         # Subclasses of torch.Tensor with custom __torch_function__ (in our case, QuantizedTensorBase)
         # is known to introduce substantial CPU overhead.
@@ -1023,7 +1050,7 @@ class Quantize(AffineQuantizerBase):
             encoding.offset,
             encoding.qmin,
             encoding.qmax,
-            block_size=self.block_size,
+            block_size=encoding.block_size,
         )
 
         if (
@@ -1149,13 +1176,17 @@ class QuantizeDequantize(AffineQuantizerBase):
             Quantize-dequantized output
 
         """
-        if not self.is_initialized():
-            raise RuntimeError(
-                "Failed to run QuantizeDequantize since quantization parameters are not initialized."
-                " Please initialize the quantization parameters using `compute_encodings()`."
-            )
-
         encoding = self.get_encodings()
+
+        if encoding is None:
+            if input.numel() == 0:
+                # Edge case: If input is an empty tensor, use arbitrary encoding
+                encoding = self._get_dummy_encoding()
+            else:
+                raise RuntimeError(
+                    "Failed to run QuantizeDequantize since quantization parameters are not initialized."
+                    " Please initialize the quantization parameters using `compute_encodings()`."
+                )
 
         # Subclasses of torch.Tensor with custom __torch_function__ (in our case, QuantizedTensorBase)
         # is known to introduce substantial CPU overhead.
@@ -1173,8 +1204,8 @@ class QuantizeDequantize(AffineQuantizerBase):
             encoding.offset,
             encoding.qmin,
             encoding.qmax,
-            block_size=self.block_size,
-            zero_point_shift=self.zero_point_shift,
+            block_size=encoding.block_size,
+            zero_point_shift=encoding.zero_point_shift,
         )
 
         if (
@@ -1191,16 +1222,20 @@ class QuantizeDequantize(AffineQuantizerBase):
 
 class Dequantize(AffineQuantizerBase):  # pylint: disable=missing-class-docstring
     def forward(self, input):
-        if not self.is_initialized():
-            raise RuntimeError(
-                "Failed to run Dequantize since quantization parameters are not initialized."
-                " Please initialize the quantization parameters using `compute_encodings()`."
-            )
-
         if self.zero_point_shift != 0.0:
             raise RuntimeError("Nonzero quant shift not supported for Dequantize")
 
         encoding = self.get_encodings()
+
+        if encoding is None:
+            if input.numel() == 0:
+                # Edge case: If input is an empty tensor, use arbitrary encoding
+                encoding = self._get_dummy_encoding()
+            else:
+                raise RuntimeError(
+                    "Failed to run Dequantize since quantization parameters are not initialized."
+                    " Please initialize the quantization parameters using `compute_encodings()`."
+                )
 
         # Subclasses of torch.Tensor with custom __torch_function__ (in our case, QuantizedTensorBase)
         # is known to introduce substantial CPU overhead.
@@ -1213,7 +1248,7 @@ class Dequantize(AffineQuantizerBase):  # pylint: disable=missing-class-docstrin
             input = input.as_subclass(torch.Tensor)
 
         output = dequantize(
-            input, encoding.scale, encoding.offset, block_size=self.block_size
+            input, encoding.scale, encoding.offset, block_size=encoding.block_size
         )
 
         if (

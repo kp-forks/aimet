@@ -32,6 +32,7 @@ from aimet_torch.v2.quantization.affine import (
     Quantize,
     QuantizeDequantize,
     ScaleOffsetQuantizer,
+    Dequantize,
 )
 from aimet_torch.v2.quantization import affine
 import aimet_torch.v2.quantization as Q
@@ -2887,3 +2888,55 @@ def test_fullgraph_compile(backend, shape, block_size, device):
         # Re-run with different shape to trigger recompilation
         x = torch.randn(2, 10, 10, device=device)
         _ = qdq(x)
+
+
+@pytest.mark.parametrize(
+    "device", ["cpu", *(["cuda"] if torch.cuda.is_available() else [])]
+)
+@pytest.mark.parametrize("qtzr_cls", [Quantize, QuantizeDequantize])
+def test_empty_input(qtzr_cls, device):
+    """
+    When: Run forward with empty input tensor before calibration
+    Then: Should return quantized tensor normally
+    """
+
+    def test_output(y: torch.Tensor):
+        assert torch.equal(x, y)
+        assert isinstance(
+            y, Q.QuantizedTensor if qtzr_cls is Quantize else Q.DequantizedTensor
+        )
+        assert isinstance(y.encoding, AffineEncoding)
+        assert y.encoding.scale == 1
+        assert y.encoding.offset == 0
+        assert y.encoding.qmin == -8
+        assert y.encoding.qmax == 7
+        assert y.encoding.symmetry
+        assert y.encoding.block_size is None
+
+    x = torch.tensor([], dtype=torch.float32, device=device)
+    qtzr = qtzr_cls(
+        shape=(),
+        qmin=-8,
+        qmax=7,
+        symmetric=True,
+        block_size=(3, 3),
+    ).to(device)
+
+    y = qtzr(x)
+    test_output(y)
+
+    """
+    When: Run calibration with empty input tensor
+    Then: Should finish calibration without error but remain uninitialized
+    """
+    with qtzr.compute_encodings():
+        y = qtzr(x)
+    assert not qtzr.is_initialized()
+    test_output(y)
+
+    """
+    When: Run forward with empty input tensor before calibration
+    Then: Should return quantized tensor normally
+    """
+    y = qtzr(x)
+    test_output(y)
