@@ -7,7 +7,7 @@ from collections import defaultdict
 import onnx_ir
 from onnxscript.rewriter import pattern
 from .fusion_registry import FUSION_PASS_REGISTRY
-from . import ir_utils
+from aimet_onnx import ir_utils
 
 
 def fuse_supergroups(

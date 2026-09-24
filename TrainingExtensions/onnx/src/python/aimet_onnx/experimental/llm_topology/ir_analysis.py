@@ -33,8 +33,7 @@ from typing import Dict, List, Optional, Tuple
 import onnx_ir
 
 from aimet_onnx.common.utils import AimetLogger
-from aimet_onnx.graph_passes.fusions import fuse_supergroups
-from aimet_onnx.graph_passes.fusions.ir_utils import is_fused_supergroup
+from aimet_onnx.graph_passes.fusions import fuse_supergroups, is_fused_supergroup
 from aimet_onnx.ir_utils import is_static, remove_quantizers
 from aimet_onnx.utils import ModelProto
 

@@ -4,7 +4,7 @@ import onnx_ir
 from onnxscript import rewriter
 from onnxscript.rewriter import pattern
 
-from aimet_onnx.graph_passes.fusions.ir_utils import get_constant_singleton_value
+from aimet_onnx.ir_utils import get_constant_singleton_value
 from aimet_onnx.graph_passes.fusions.fusion_registry import (
     register_fusion,
     AIMET_SUPERGROUP_DOMAIN,
