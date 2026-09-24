@@ -17,12 +17,10 @@ class Product(_Product):
 
     def __init__(self, name, shape):
         super().__init__(name, shape)
-        self.tensor_dict = {}
         self.tensor = None
 
     def set_as_param(self, op: "Op", tensor: TensorProto):
         self.shape = tensor.dims
         self.is_parm = True
-        self.tensor_dict[op] = tensor
         self.tensor = tensor
         self.is_const = False  # Backward compatibility

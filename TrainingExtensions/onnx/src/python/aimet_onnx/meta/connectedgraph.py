@@ -274,9 +274,6 @@ class ConnectedGraph(AimetCommonConnectedGraph):
                 product = self._products[inp]
                 op.add_input(product)
                 product.add_consumer(op)
-                product.tensor_dict[op] = (
-                    inp  # TODO: Delete Product.tensor_dict attribute
-                )
 
             for output in node.output:
                 product = self._products[output]
@@ -299,8 +296,6 @@ class ConnectedGraph(AimetCommonConnectedGraph):
             product.shape = product_shape
             product.is_parm = True
             my_op.add_param(param_name, product, product_type)
-            # TODO: Delete Product.tensor_dict, Product.tensor attributes
-            product.tensor_dict[my_op] = param_tensor
             product.tensor = param_tensor
             product.is_const = False  # Backward compatibility
 
