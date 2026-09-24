@@ -6919,20 +6919,21 @@ def test_to_onnx_qdq(
     dq_nodes = [
         node for node in onnx_qdq_model.graph.node if node.op_type == "DequantizeLinear"
     ]
+
     with (
-        sim._insert_data_movement_op_output_quantizers(),
-        (
-            sim._concretize_int32_bias_quantizers()
-            if export_int32_bias_encodings
-            else contextlib.nullcontext()
-        ),
+        sim._concretize_int32_bias_quantizers()
+        if export_int32_bias_encodings
+        else contextlib.nullcontext(),
     ):
-        expected_quantizers = {
-            name: qtzr
-            for name, qtzr in sim.qc_quantize_op_dict.items()
-            if qtzr.enabled
-            and (qtzr.data_type == QuantizationDataType.int or qtzr.bitwidth < 16)
-        }
+        tensor_quantizers = [
+            sim._get_enabled_quantizer(tensor)
+            for tensor in sim.connected_graph.get_all_products()
+        ]
+        expected_quantizers = [
+            q
+            for q in tensor_quantizers
+            if q and (q.data_type == QuantizationDataType.int or q.bitwidth < 16)
+        ]
 
     assert len(dq_nodes) == len(expected_quantizers)
 
@@ -7835,25 +7836,6 @@ def test_insert_data_movement_op_quantizers(model_factory):
     )
     inputs = {input_name: np.random.randn(*input_shape).astype(np.float32)}
     sim.compute_encodings(lambda session: session.run(None, inputs))
-    """
-    When: Call _insert_data_movement_op_quantizers()
-    Then: All temporarily added QcQuantizers should be removed/disabled
-    """
-    qc_quantizers_before = {
-        name: qtzr and qtzr.enabled for name, qtzr in sim.qc_quantize_op_dict.items()
-    }
-    nodes_before = [copy.deepcopy(node) for node in sim.model.model.graph.node]
-
-    with sim._insert_data_movement_op_output_quantizers():
-        pass
-
-    qc_quantizers_after = {
-        name: qtzr and qtzr.enabled for name, qtzr in sim.qc_quantize_op_dict.items()
-    }
-    nodes_after = [copy.deepcopy(node) for node in sim.model.model.graph.node]
-
-    assert qc_quantizers_before == qc_quantizers_after
-    assert nodes_before == nodes_after
 
     onnx_qdq_before = sim.to_onnx_qdq(prequantize_constants=False)
 
