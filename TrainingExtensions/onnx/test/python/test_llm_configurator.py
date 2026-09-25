@@ -4,6 +4,7 @@
 import json
 import platform
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -17,14 +18,20 @@ skip_module_on_windows_arm64(
 from aimet_onnx.utils import make_dummy_input
 
 from aimet_onnx.common.defs import QuantScheme
-from aimet_onnx.quantsim import QuantizationSimModel as QuantSimOnnx
+from aimet_onnx.quantsim import QuantizationSimModel
 
+from aimet_onnx.experimental.llm_configurator import llm_configurator
 from aimet_onnx.experimental.llm_configurator.llm_configurator import (
     _apply_int8_kv_cache_tying_and_lm_head,
+    _collect_all_projections,
     _set_matmul_second_input_to_8b,
     _get_quantizer_no_split_slice,
     _tie_quantizers_for_kv_cache,
+    configure_llm,
 )
+from aimet_onnx.experimental.llm_topology import analyze_llm_topology
+from aimet_onnx.defs import QSpec
+import aimet_onnx
 
 import onnx
 import os
@@ -37,9 +44,39 @@ from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM, Phi3Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Config
 from transformers.cache_utils import DynamicCache
 
-from .models import models_for_tests, transformer_blocks
+from .models import models_for_tests, style_decoders, transformer_blocks
 
 from aimet_onnx.quantsim import QuantizationSimModel
+
+
+_NUM_LAYERS = 2
+
+
+def _kv_cache_io_names(num_layers: int = _NUM_LAYERS) -> list[tuple[str, str]]:
+    """Returns the (input, output) kv-cache tensor name pairs of the decoder fixtures."""
+    return [
+        (f"past_{kind}_{layer}_in", f"past_{kind}_{layer}_out")
+        for layer in range(num_layers)
+        for kind in ("key", "value")
+    ]
+
+
+def _param_precision(sim: QuantizationSimModel, node_name: str):
+    """Returns the precision of the weight quantizer of ``node_name``."""
+    op = sim.connected_graph.get_all_ops()[node_name]
+    _, _, param_quantizers = sim.get_op_quantizers(op)
+    return param_quantizers["weight"].precision()
+
+
+def _all_param_precisions(sim: QuantizationSimModel) -> dict:
+    """Returns the precision of every param quantizer, keyed by (node name, param name)."""
+    precisions = {}
+    for node_name, op in sim.connected_graph.get_all_ops().items():
+        _, _, param_quantizers = sim.get_op_quantizers(op)
+        for param_name, quantizer in param_quantizers.items():
+            precisions[(node_name, param_name)] = quantizer.precision()
+
+    return precisions
 
 
 def _get_enabled_quantizer_name(quant_sim, tensor_name: str) -> QcQuantizeOp:
@@ -81,7 +118,7 @@ def _get_enabled_quantizer_name(quant_sim, tensor_name: str) -> QcQuantizeOp:
 
 
 def check_config(
-    quant_sim: QuantSimOnnx,
+    quant_sim: QuantizationSimModel,
     encodings_path: str,
     kv_io_map: dict,
     lm_head_tensor_name: str,
@@ -334,7 +371,7 @@ def apply_to_model(model_id, tmp_path):
     else:
         providers = ["CPUExecutionProvider"]
 
-    quant_sim = QuantSimOnnx(
+    quant_sim = QuantizationSimModel(
         model=onnx_model,
         quant_scheme=QuantScheme.post_training_tf,
         default_activation_bw=16,
@@ -474,3 +511,300 @@ class TestLLMConfigurator:
         assert not expected_not_tied_value_quantizers.intersection(
             tied_value_cache_quantizers
         )
+
+
+@pytest.fixture(scope="module")
+def decoder_model():
+    """Decoder stack with paired ``past_{key,value}_{layer}_{in,out}`` kv-cache I/O."""
+    return transformer_blocks.sha_gqa_decoder(num_layers=_NUM_LAYERS)
+
+
+@pytest.fixture
+def sim(decoder_model):
+    return QuantizationSimModel(decoder_model)
+
+
+#: Cheap stand-in for a real Qwen3 config, matching the dimensions the spinquant
+#: tests use to exercise the headless/embedding-less export variants.
+_QWEN3_SMALL = dict(
+    num_hidden_layers=_NUM_LAYERS,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=32,
+    intermediate_size=128,
+    vocab_size=16,
+    hidden_size=64,
+)
+
+
+@pytest.fixture(scope="module")
+def qwen3_models():
+    """Qwen3 causal LM exports keyed by ``(with_lm_head, with_embedding)``."""
+    return {
+        (with_lm_head, with_embedding): transformer_blocks.qwen3_causal_lm(
+            with_lm_head=with_lm_head, with_embedding=with_embedding, **_QWEN3_SMALL
+        )
+        for with_lm_head in (True, False)
+        for with_embedding in (True, False)
+    }
+
+
+class TestConfigureLlm:
+    """Tests for :func:`configure_llm`"""
+
+    def test_ties_kv_cache_quantizers(self, sim):
+        """Each kv-cache input shares one quantizer with the output of the same layer."""
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology)
+
+        for input_name, output_name in _kv_cache_io_names():
+            # The output quantizer sits upstream of the graph output, so it is
+            # reached through the enabled-quantizer walk rather than by name.
+            assert sim.qc_quantize_op_dict[input_name] is sim._get_enabled_quantizer(
+                output_name
+            )
+
+    def test_kv_cache_quantizers_are_tied_per_layer(self, sim):
+        """Tying does not merge separate caches into a single quantizer."""
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology)
+
+        # No KV input quantizers are tied to each other
+        input_quantizers = [
+            sim.qc_quantize_op_dict[input_name]
+            for input_name, _ in _kv_cache_io_names()
+        ]
+        assert len({id(quantizer) for quantizer in input_quantizers}) == len(
+            input_quantizers
+        )
+
+        # No KV output quantizers are tied to each other
+        output_quantizers = [
+            sim.qc_quantize_op_dict[output_name]
+            for _, output_name in _kv_cache_io_names()
+        ]
+        assert len({id(quantizer) for quantizer in output_quantizers}) == len(
+            output_quantizers
+        )
+
+    @pytest.mark.parametrize(
+        "precision", [aimet_onnx.int8, aimet_onnx.int16, "int8", "int16"]
+    )
+    def test_sets_kv_cache_precision(self, sim, precision):
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology, kv_cache_type=precision)
+
+        expected = (
+            aimet_onnx.qtype.from_string(precision)
+            if isinstance(precision, str)
+            else precision
+        )
+        for input_name, output_name in _kv_cache_io_names():
+            assert sim.qc_quantize_op_dict[input_name].precision() == expected
+            assert sim._get_enabled_quantizer(output_name).precision() == expected
+
+    def test_sets_projection_weight_precision(self, sim):
+        """Every projection of every block is reprecisioned, lm head is not."""
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology, projection_weight_type=aimet_onnx.int4)
+
+        projections = _collect_all_projections(topology)
+        assert len(projections) == 24  # 8 qkv + o + gate + up + down, per block
+        for node_name in projections:
+            assert _param_precision(sim, node_name) == aimet_onnx.int4
+
+        # lm_head is not a block projection, so it keeps the sim default.
+        (lm_head,) = topology.lm_head
+        assert _param_precision(sim, lm_head) == aimet_onnx.int8
+
+    def test_sets_lm_head_weight_precision(self, sim):
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology, lm_head_weight_type=aimet_onnx.int4)
+
+        (lm_head,) = topology.lm_head
+        assert _param_precision(sim, lm_head) == aimet_onnx.int4
+        # Block projections are untouched by an lm-head-only call.
+        for node_name in _collect_all_projections(topology):
+            assert _param_precision(sim, node_name) == aimet_onnx.int8
+
+    @pytest.mark.parametrize(
+        "decoder_cls, expected_projections",
+        [
+            # Unfused q/k/v and gate/up: 3 qkv + o + gate + up + down, per block.
+            pytest.param(style_decoders.LlamaStyleDecoder, 14, id="unfused"),
+            # Fused qkv_proj/gate_up_proj collapse into one node each
+            pytest.param(style_decoders.Phi3StyleDecoder, 8, id="fused"),
+        ],
+    )
+    def test_sets_projection_weight_precision_of_fused_projections(
+        self, decoder_cls, expected_projections
+    ):
+        """Fused read projections are reprecisioned, not silently skipped."""
+        model = style_decoders._export_decoder_with_ids(
+            decoder_cls(), add_value_input=False
+        )
+        sim = QuantizationSimModel(model)
+        topology = analyze_llm_topology(sim.model.model)
+
+        configure_llm(sim, topology, projection_weight_type=aimet_onnx.int4)
+
+        projections = _collect_all_projections(topology)
+        assert len(projections) == expected_projections
+        for node_name in projections:
+            assert _param_precision(sim, node_name) == aimet_onnx.int4
+
+    def test_accepts_qspec_weight_type(self, sim):
+        """A QSpec configures granularity, not just bitwidth."""
+        topology = analyze_llm_topology(sim.model.model)
+        spec = QSpec.lpbq(aimet_onnx.int4, block_size=8)
+
+        configure_llm(sim, topology, projection_weight_type=spec)
+
+        for node_name in _collect_all_projections(topology):
+            op = sim.connected_graph.get_all_ops()[node_name]
+            _, _, param_quantizers = sim.get_op_quantizers(op)
+            quantizer = param_quantizers["weight"]
+            assert quantizer.precision() == aimet_onnx.int4
+            assert quantizer.quant_info.blockSize == 8
+            assert quantizer.quant_info.usePerChannelMode
+
+    def test_leaves_precisions_unchanged_when_no_type_given(self, sim):
+        """With no precision argument the call only ties quantizers."""
+        topology = analyze_llm_topology(sim.model.model)
+        before = {
+            name: quantizer.precision()
+            for name, quantizer in sim.qc_quantize_op_dict.items()
+        }
+
+        configure_llm(sim, topology)
+
+        after = {
+            name: quantizer.precision()
+            for name, quantizer in sim.qc_quantize_op_dict.items()
+        }
+        assert before == after
+
+    def test_raises_on_unpaired_kv_cache_names(self, sim):
+        topology = analyze_llm_topology(sim.model.model)
+        topology.past_key_output_names.pop()
+
+        with pytest.raises(RuntimeError, match="cache inputs and outputs"):
+            configure_llm(sim, topology)
+
+        topology = analyze_llm_topology(sim.model.model)
+        topology.past_value_output_names.pop()
+
+        with pytest.raises(RuntimeError, match="cache inputs and outputs"):
+            configure_llm(sim, topology)
+
+    @pytest.mark.parametrize("with_lm_head", [True, False])
+    @pytest.mark.parametrize("with_embedding", [True, False])
+    def test_configures_headless_and_embeddingless_models(
+        self, qwen3_models, with_lm_head, with_embedding
+    ):
+        """
+        Exports without an lm head and/or without embed_tokens configure the same.
+        """
+        sim = QuantizationSimModel(qwen3_models[(with_lm_head, with_embedding)])
+        topology = analyze_llm_topology(sim.model.model)
+        assert bool(topology.lm_head) == with_lm_head
+        assert bool(topology.embed_tokens) == with_embedding
+
+        configure_llm(
+            sim,
+            topology,
+            kv_cache_type=aimet_onnx.int16,
+            projection_weight_type=aimet_onnx.int4,
+        )
+
+        for input_name, output_name in _kv_cache_io_names():
+            quantizer = sim.qc_quantize_op_dict[input_name]
+            assert quantizer is sim._get_enabled_quantizer(output_name)
+            assert quantizer.precision() == aimet_onnx.int16
+
+        projections = _collect_all_projections(topology)
+        assert len(projections) == 7 * _NUM_LAYERS
+        for node_name in projections:
+            assert _param_precision(sim, node_name) == aimet_onnx.int4
+
+    def test_ignores_lm_head_type_when_model_has_no_lm_head(self, qwen3_models):
+        """``lm_head_weight_type`` on a headless model reprecisions nothing."""
+        sim = QuantizationSimModel(qwen3_models[(False, True)])
+        topology = analyze_llm_topology(sim.model.model)
+        before = _all_param_precisions(sim)
+
+        configure_llm(sim, topology, lm_head_weight_type=aimet_onnx.int4)
+
+        assert _all_param_precisions(sim) == before
+
+    @pytest.mark.parametrize(
+        "config_file, expected_kv_precision, expect_warning",
+        [
+            # V69 does not support int16 dynamic matmul inputs, so the exception rules
+            # force the requested kv-cache precision back down to int8.
+            ("htp_v69", aimet_onnx.int8, True),
+            # V73 honors the request, and instead promotes the untouched matmul inputs
+            # feeding the kv-cache to int16. That is not an override of the request.
+            ("htp_v73", aimet_onnx.int16, False),
+        ],
+    )
+    def test_warns_only_when_backend_overrides_requested_precision(
+        self, decoder_model, config_file, expected_kv_precision, expect_warning
+    ):
+        """Precisions changed by the exception rules only warn if they were requested here."""
+        sim = QuantizationSimModel(decoder_model, config_file=config_file)
+        topology = analyze_llm_topology(sim.model.model)
+
+        with mock.patch.object(llm_configurator.logger, "warning") as mock_warning:
+            configure_llm(
+                sim,
+                topology,
+                kv_cache_type=aimet_onnx.int16,
+                projection_weight_type=aimet_onnx.int4,
+            )
+
+        for input_name, output_name in _kv_cache_io_names():
+            assert sim.qc_quantize_op_dict[input_name].precision() == (
+                expected_kv_precision
+            )
+            assert sim._get_enabled_quantizer(output_name).precision() == (
+                expected_kv_precision
+            )
+
+        assert mock_warning.called == expect_warning
+        if expect_warning:
+            message = mock_warning.call_args[0][0] % tuple(
+                mock_warning.call_args[0][1:]
+            )
+            assert "int16 -> int8" in message
+            assert "past_key_0_in" in message
+
+    def test_does_not_warn_when_no_type_given(self, decoder_model):
+        """Configuring nothing cannot override anything, even on a constrained backend."""
+        sim = QuantizationSimModel(decoder_model, config_file="htp_v69")
+        topology = analyze_llm_topology(sim.model.model)
+
+        with mock.patch.object(llm_configurator.logger, "warning") as mock_warning:
+            configure_llm(sim, topology)
+
+        assert not mock_warning.called
+
+    def test_raises_on_analyzed_topology_with_unpaired_kv_cache_names(self):
+        """A decoder with a kv-cache input but no matching output is rejected.
+
+        ``LlamaStyleDecoder`` is exported with a dangling ``past_value_0`` input and
+        no kv-cache outputs, so the analyzed topology cannot be paired.
+        """
+        model = style_decoders._export_decoder_with_ids(
+            style_decoders.LlamaStyleDecoder()
+        )
+        sim = QuantizationSimModel(model)
+        topology = analyze_llm_topology(sim.model.model)
+
+        with pytest.raises(RuntimeError, match="value cache inputs and outputs"):
+            configure_llm(sim, topology)

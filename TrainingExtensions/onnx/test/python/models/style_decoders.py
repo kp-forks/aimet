@@ -103,9 +103,14 @@ def _export_decoder(module: nn.Module) -> onnx.ModelProto:
     return _attach_past_value_input(_export_to_onnx(module, x))
 
 
-def _export_decoder_with_ids(module: nn.Module) -> onnx.ModelProto:
+def _export_decoder_with_ids(
+    module: nn.Module, add_value_input=True
+) -> onnx.ModelProto:
     token_ids = torch.randint(0, _VOCAB, (_B, _SEQ))
-    return _attach_past_value_input(_export_to_onnx(module, token_ids))
+    model = _export_to_onnx(module, token_ids)
+    if add_value_input:
+        model = _attach_past_value_input(model)
+    return model
 
 
 def _export_vit(module: nn.Module) -> onnx.ModelProto:
