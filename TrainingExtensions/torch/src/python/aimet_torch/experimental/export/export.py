@@ -216,9 +216,6 @@ def _insert_output_qdq(
     node.replace_all_uses_with(output_dq)
     output_q.args = (node, *input_q.args[1:])
 
-    ep.graph.eliminate_dead_code()
-    ep.graph_module.recompile()
-
 
 def _try_insert_input_qdq(ep: ExportedProgram, node: torch.fx.Node):
     if node.all_input_nodes:
@@ -271,9 +268,6 @@ def _try_insert_input_qdq(ep: ExportedProgram, node: torch.fx.Node):
 
     input.replace_all_uses_with(input_dq)
     input_q.args = (input, *input_q.args[1:])
-
-    ep.graph.eliminate_dead_code()
-    ep.graph_module.recompile()
 
 
 def _get_output_qdq(

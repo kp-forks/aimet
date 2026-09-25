@@ -67,6 +67,7 @@ def llama_rms_norm(**_):
     )
 
 
+@pytest.mark.parallel
 @pytest.mark.skipif(
     version.parse(torch.__version__) < version.parse("2.8.0"),
     reason="aimet_torch.export.export is only supported in torch >= 2.8.0",
@@ -210,6 +211,7 @@ def test_export(model_factory, compile: bool, tmp_path: Path):
     _detect_fake_mode_from_gm(ep.graph_module)  # Shouldn't raise error
 
 
+@pytest.mark.parallel
 def test_shared_weight(tmp_path: Path):
     """
     Given: A model with shared weights
@@ -391,6 +393,7 @@ def test_compute_missing_encodings(device: str, tmp_path: Path):
     )
 
 
+@pytest.mark.parallel
 @pytest.mark.parametrize(
     "op",
     [
@@ -481,6 +484,7 @@ def test_multi_output_grid_preserving_ops(op: Callable[[torch.Tensor], Any]):
         assert output_dq.args[1:] == input_dq.args[1:]
 
 
+@pytest.mark.parallel
 def test_compute_missing_encodings_with_constant():
     """
     Given: Model with hardcoded constant that is neither a parameter nor a buffer
@@ -581,6 +585,7 @@ def test_dynamic_shape():
         _ = ep.module()(torch.randn(batch_size, 3, 32, 32))
 
 
+@pytest.mark.parallel
 def test_preserve_graph_signature():
     """
     Given: A model with unused user input
